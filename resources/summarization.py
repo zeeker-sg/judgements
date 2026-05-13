@@ -11,6 +11,15 @@ Pass 2 (sanity check): one final call on the completed rolling summary.
 Strips rolling artefacts (meta-text, duplicate headers), checks internal
 coherence, and compresses to the dynamic character limit.
 
+Batch cap
+---------
+``_MAX_BATCHES`` (env ``JUDGMENTS_SUMMARY_MAX_BATCHES``, default 20) caps the
+number of rolling calls per document. For large judgments the effective
+batch_size widens via ceiling-division so exactly ``_MAX_BATCHES`` passes
+cover the full fragment list. A 957-fragment judgment that would need 96
+batches at batch_size=10 is handled in 20 passes at batch_size=48 instead,
+keeping per-document wall-time proportional to _MAX_BATCHES.
+
 Dynamic length limit
 --------------------
 ``max_summary_chars(fragment_count)`` returns:
@@ -184,6 +193,9 @@ def _render_fragment(frag: Dict[str, Any]) -> str:
 
 # ── Rolling summariser ────────────────────────────────────────────────────────
 
+_MAX_BATCHES = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_BATCHES", "20"))
+
+
 def rolling_summarise(
     row: Dict[str, Any],
     fragments: List[Dict[str, Any]],
@@ -217,7 +229,13 @@ def rolling_summarise(
     limit = max_summary_chars(n_frags)
     call_max_tokens = 4096
 
-    batches = [frag_texts[i : i + batch_size] for i in range(0, len(frag_texts), batch_size)]
+    # Cap at _MAX_BATCHES by widening batch_size for large docs.  For a
+    # 957-frag judgment the default batch_size=10 yields 96 batches; with the
+    # cap we stride at 48 frags/batch (20 batches) instead, keeping wall-time
+    # proportional to _MAX_BATCHES rather than doc length.
+    effective_batch = max(batch_size, -(-len(frag_texts) // _MAX_BATCHES))  # ceiling div
+
+    batches = [frag_texts[i : i + effective_batch] for i in range(0, len(frag_texts), effective_batch)]
     summary = ""
 
     # Pass 1: rolling
