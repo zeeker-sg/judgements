@@ -369,6 +369,7 @@ vars (handy for smoke tests — no code edits required):
 | `JUDGMENTS_EXTRACT_DELAY_JITTER` | `0.5` | Phase 2: +/- jitter on the sleep. |
 | `JUDGMENTS_SUMMARY_ENABLED` | `1` | Phase 3: set to `0` to skip summarisation. |
 | `JUDGMENTS_SUMMARY_MAX_PER_RUN` | `15` | Phase 3: max docs summarised per `zeeker build`. |
+| `JUDGMENTS_SUMMARY_MAX_BATCHES` | `20` | Phase 3: max rolling-pass batches per doc (wider batch_size for large docs). |
 | `JUDGMENTS_SUMMARY_MAX_RETRIES` | `3` | Phase 3: failures before a doc is quarantined. |
 | `JUDGMENTS_SUMMARY_RETRY_AFTER` | `86400` | Phase 3: quarantine TTL in seconds (default 24h). |
 | `JUDGMENTS_SUMMARY_MAX_INPUT_CHARS` | `32000` | Phase 3: char budget for composed LLM input (~8K tokens). |
