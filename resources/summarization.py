@@ -102,25 +102,23 @@ _SANITY_SYSTEM = """\
 You are a senior Singapore lawyer reviewing a draft case summary for a legal research database."""
 
 _SANITY_PROMPT = """\
-Review this draft summary of a Singapore court judgment and return a cleaned version:
-
-1. Remove meta-text — delete phrases like "Summary so far", "Updated summary", \
-"Draft summary", batch markers, or any internal process notes
-2. Check coherence — does the holding follow from the facts and reasoning? \
-Flag contradictions with [CHECK: reason] rather than silently removing them
-3. Verify completeness — all three sections (Facts, Holding, Reasons) should be present; \
-flag any that are absent or suspiciously thin
-4. Enforce length — the final summary must be under {limit} characters; if longer, \
-condense by removing less important detail (never truncate mid-sentence)
-
-If the summary is already clean and coherent, return it with only light edits. \
-Do not add information that is not in the draft.
+The following draft summary of a Singapore court judgment is too long. \
+Condense it to under {limit} characters while preserving the three-section \
+structure (Facts, Holding, Reasons). Remove less important detail; \
+never truncate mid-sentence.
 
 <draft_summary>
 {summary}
 </draft_summary>
 
-Cleaned summary:"""
+Condensed summary:"""
+
+# Regex to strip common rolling-pass artefacts from Pass 1 output.
+_META_PREFIX_RE = re.compile(
+    r"^\s*(Updated summary|Summary so far|Draft summary|"
+    r"Summary\s*\(Facts[^)]*\))\s*:?\s*",
+    re.IGNORECASE,
+)
 
 
 # ── LLM helpers ──────────────────────────────────────────────────────────────
@@ -203,7 +201,7 @@ def rolling_summarise(
     client,
     *,
     batch_size: int = 10,
-    timeout: float = 120.0,
+    timeout: float = 300.0,
 ) -> str:
     """Two-pass rolling summariser. See module docstring for design notes.
 
@@ -227,7 +225,9 @@ def rolling_summarise(
     # Dynamic limit based on actual rendered fragment count.
     n_frags = row.get("fragment_count") or len(frag_texts)
     limit = max_summary_chars(n_frags)
-    call_max_tokens = 4096
+    # Scale token budget with the char limit — Gemma4:26b uses ~2 chars/token.
+    # Add 1024 overhead for thinking tokens that count against the same budget.
+    call_max_tokens = max(4096, limit // 2 + 1024)
 
     # Cap at _MAX_BATCHES by widening batch_size for large docs.  For a
     # 957-frag judgment the default batch_size=10 yields 96 batches; with the
@@ -257,8 +257,15 @@ def rolling_summarise(
             timeout=timeout,
         )
 
-    # Pass 2: sanity check
-    sanity_user = _SANITY_PROMPT.format(summary=summary, limit=limit)
+    # Pass 2: sanity check — strip Python-side artefacts first.
+    cleaned = _META_PREFIX_RE.sub("", summary).strip()
+
+    # Skip the LLM call when Pass 1 already produced a clean, within-limit result.
+    if len(cleaned) <= limit:
+        return cleaned
+
+    # Summary exceeds the limit — one focused LLM call to condense it.
+    sanity_user = _SANITY_PROMPT.format(summary=cleaned, limit=limit)
     final = _call_once(
         messages=[
             {"role": "system", "content": _SANITY_SYSTEM},
