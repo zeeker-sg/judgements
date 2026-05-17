@@ -212,6 +212,9 @@ def _render_fragment(frag: Dict[str, Any]) -> str:
 # ── Rolling summariser ────────────────────────────────────────────────────────
 
 _MAX_BATCHES = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_BATCHES", "20"))
+# Alt-model passes: fewer, wider batches — more fragments per call, fewer
+# rolling steps. DeepSeek V4 Flash handles ~50–100 frags/call comfortably.
+_MAX_BATCHES_ALT = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_BATCHES_ALT", "5"))
 
 
 def rolling_summarise(
@@ -221,6 +224,7 @@ def rolling_summarise(
     client,
     *,
     batch_size: int = 10,
+    max_batches: int = _MAX_BATCHES,
     timeout: float = 300.0,
 ) -> str:
     """Two-pass rolling summariser. See module docstring for design notes.
@@ -252,8 +256,9 @@ def rolling_summarise(
     # Cap at _MAX_BATCHES by widening batch_size for large docs.  For a
     # 957-frag judgment the default batch_size=10 yields 96 batches; with the
     # cap we stride at 48 frags/batch (20 batches) instead, keeping wall-time
-    # proportional to _MAX_BATCHES rather than doc length.
-    effective_batch = max(batch_size, -(-len(frag_texts) // _MAX_BATCHES))  # ceiling div
+    # proportional to max_batches rather than doc length. The alt model uses
+    # max_batches=5 so each pass sees more fragments (fewer, wider passes).
+    effective_batch = max(batch_size, -(-len(frag_texts) // max_batches))  # ceiling div
 
     batches = [frag_texts[i : i + effective_batch] for i in range(0, len(frag_texts), effective_batch)]
     summary = ""

@@ -379,6 +379,7 @@ vars (handy for smoke tests — no code edits required):
 | `LLM_BASE_URL_2` | *unset* | Phase 3: alt endpoint for docs that hit the primary failure cap (count≥3). Unset → quarantine behaviour unchanged. |
 | `LLM_API_KEY_2` | falls back to `LLM_API_KEY` | Phase 3: API key for the alt endpoint. |
 | `LLM_MODEL_2` | same as `LLM_MODEL` | Phase 3: model name on the alt endpoint. |
+| `JUDGMENTS_SUMMARY_MAX_BATCHES_ALT` | `5` | Phase 3: rolling-pass cap for alt-model calls. Fewer, wider batches (vs 20 for primary) — alt model handles more fragments per call. |
 
 ### Operational notes
 - **Phase 1 checkpointing:** state lives in

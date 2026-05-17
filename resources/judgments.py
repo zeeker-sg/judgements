@@ -837,6 +837,7 @@ def _summarise_row(
     model: str,
     *,
     endpoint: str = "",
+    max_batches: int = summarization._MAX_BATCHES,
 ) -> Tuple[str, Optional[str]]:
     """Generate + persist a summary for one row. Returns ``(status, detail)``.
 
@@ -872,7 +873,9 @@ def _summarise_row(
     )
 
     try:
-        summary_text = summarization.rolling_summarise(row, fragments, model, client)
+        summary_text = summarization.rolling_summarise(
+            row, fragments, model, client, max_batches=max_batches
+        )
     except Exception as exc:
         return "error", f"{type(exc).__name__}: {exc}"
 
@@ -918,6 +921,7 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
 
     client_alt = summarization.make_client_alt()
     model_alt = summarization.resolve_model_alt()
+    max_batches_alt = summarization._MAX_BATCHES_ALT
 
     _ensure_phase3_columns(existing_table)
     model = summarization.resolve_model()
@@ -969,7 +973,12 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
             label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
             try:
                 status, detail = _summarise_row(
-                    row, existing_table, use_client, use_model, endpoint=use_endpoint
+                    row,
+                    existing_table,
+                    use_client,
+                    use_model,
+                    endpoint=use_endpoint,
+                    max_batches=max_batches_alt if use_alt else summarization._MAX_BATCHES,
                 )
             except Exception as exc:  # defensive
                 failures += 1
