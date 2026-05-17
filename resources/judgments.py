@@ -835,6 +835,8 @@ def _summarise_row(
     existing_table: Table,
     client,
     model: str,
+    *,
+    endpoint: str = "",
 ) -> Tuple[str, Optional[str]]:
     """Generate + persist a summary for one row. Returns ``(status, detail)``.
 
@@ -878,7 +880,7 @@ def _summarise_row(
         return "error", "empty response"
 
     now_iso = datetime.now().isoformat(timespec="seconds")
-    endpoint = os.environ.get("LLM_BASE_URL", "")
+    endpoint = endpoint or os.environ.get("LLM_BASE_URL", "")
     summary_cache.write_summary_atomic(
         jid,
         {
@@ -914,6 +916,9 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
         click.echo("Phase 3: LLM not configured (LLM_BASE_URL unset) — skipping.")
         return
 
+    client_alt = summarization.make_client_alt()
+    model_alt = summarization.resolve_model_alt()
+
     _ensure_phase3_columns(existing_table)
     model = summarization.resolve_model()
 
@@ -931,9 +936,10 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
         click.echo("Phase 3: no rows need summarisation.")
         return
 
+    alt_info = f", alt_model={model_alt}" if client_alt else ""
     click.echo(
         f"Phase 3: summarising up to {SUMMARY_MAX_PER_RUN} / {remaining_total} "
-        f"remaining (model={model}, max_chars={SUMMARY_MAX_INPUT_CHARS})"
+        f"remaining (model={model}{alt_info}, max_chars={SUMMARY_MAX_INPUT_CHARS})"
     )
 
     successes = 0
@@ -947,18 +953,29 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
             if attempted >= SUMMARY_MAX_PER_RUN:
                 break
             jid = row["id"]
-            if _is_summary_quarantined(state, jid, now):
+            fail_count = state.get("failures", {}).get(jid, {}).get("count", 0)
+            # Docs that have hit the primary failure cap route to the alt model
+            # (if configured) regardless of TTL — the point is to try a different
+            # model, not to wait. Without an alt client, apply normal quarantine.
+            use_alt = fail_count >= SUMMARY_MAX_RETRIES and client_alt is not None
+            if not use_alt and _is_summary_quarantined(state, jid, now):
                 skipped_quarantined += 1
                 continue
             attempted += 1
+            use_client = client_alt if use_alt else client
+            use_model = model_alt if use_alt else model
+            use_endpoint = os.environ.get("LLM_BASE_URL_2" if use_alt else "LLM_BASE_URL", "")
+            route_tag = " [alt]" if use_alt else ""
             label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
             try:
-                status, detail = _summarise_row(row, existing_table, client, model)
+                status, detail = _summarise_row(
+                    row, existing_table, use_client, use_model, endpoint=use_endpoint
+                )
             except Exception as exc:  # defensive
                 failures += 1
                 _record_summary_failure(state, jid, exc)
                 click.echo(
-                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label} → UNEXPECTED: {exc}",
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → UNEXPECTED: {exc}",
                     err=True,
                 )
                 save_summary_state(state)
@@ -967,17 +984,17 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
             if status == "ok":
                 successes += 1
                 _clear_summary_failure(state, jid)
-                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label} → {detail}")
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → {detail}")
             elif status == "cached":
                 cached_hits += 1
                 _clear_summary_failure(state, jid)
-                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label} → cached")
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → cached")
             else:  # error
                 failures += 1
                 fake = RuntimeError(detail or "llm error")
                 _record_summary_failure(state, jid, fake)
                 click.echo(
-                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label} → llm failed: {detail}",
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → llm failed: {detail}",
                     err=True,
                 )
             save_summary_state(state)

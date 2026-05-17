@@ -376,6 +376,9 @@ vars (handy for smoke tests — no code edits required):
 | `LLM_BASE_URL` | *unset* | Phase 3: OpenAI-compatible endpoint. Unset → Phase 3 skips. |
 | `LLM_API_KEY` | `not-needed` | Phase 3: optional for local servers; required for cloud. |
 | `LLM_MODEL` | `llama3.1:8b` | Phase 3: any model the endpoint accepts. |
+| `LLM_BASE_URL_2` | *unset* | Phase 3: alt endpoint for docs that hit the primary failure cap (count≥3). Unset → quarantine behaviour unchanged. |
+| `LLM_API_KEY_2` | falls back to `LLM_API_KEY` | Phase 3: API key for the alt endpoint. |
+| `LLM_MODEL_2` | same as `LLM_MODEL` | Phase 3: model name on the alt endpoint. |
 
 ### Operational notes
 - **Phase 1 checkpointing:** state lives in

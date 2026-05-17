@@ -134,8 +134,28 @@ def make_client():
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
+def make_client_alt():
+    """Build the alt OpenAI-compatible client for quarantine-routed docs, or None."""
+    base_url = os.environ.get("LLM_BASE_URL_2", "").strip()
+    if not base_url:
+        return None
+    from openai import OpenAI
+
+    api_key = (
+        os.environ.get("LLM_API_KEY_2", "").strip()
+        or os.environ.get("LLM_API_KEY", "").strip()
+        or "not-needed"
+    )
+    return OpenAI(base_url=base_url, api_key=api_key)
+
+
 def resolve_model(default: str = "llama3.1:8b") -> str:
     return os.environ.get("LLM_MODEL", "").strip() or default
+
+
+def resolve_model_alt() -> str:
+    primary = os.environ.get("LLM_MODEL", "").strip() or "llama3.1:8b"
+    return os.environ.get("LLM_MODEL_2", "").strip() or primary
 
 
 def _call_once(
