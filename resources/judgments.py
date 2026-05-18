@@ -848,8 +848,6 @@ def _summarise_row(
     model: str,
     *,
     endpoint: str = "",
-    max_batches: int = summarization._MAX_BATCHES,
-    call_max_tokens_override: int = 0,
 ) -> Tuple[str, Optional[str]]:
     """Generate + persist a summary for one row. Returns ``(status, detail)``.
 
@@ -885,11 +883,7 @@ def _summarise_row(
     )
 
     try:
-        summary_text = summarization.rolling_summarise(
-            row, fragments, model, client,
-            max_batches=max_batches,
-            call_max_tokens_override=call_max_tokens_override,
-        )
+        summary_text = summarization.rolling_summarise(row, fragments, model, client)
     except Exception as exc:
         return "error", f"{type(exc).__name__}: {exc}"
 
@@ -933,34 +927,42 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
         click.echo("Phase 3: LLM not configured (LLM_BASE_URL unset) — skipping.")
         return
 
-    client_alt = summarization.make_client_alt()
-    model_alt = summarization.resolve_model_alt()
-    max_batches_alt = summarization._MAX_BATCHES_ALT
-
     _ensure_phase3_columns(existing_table)
     model = summarization.resolve_model()
 
     state = load_summary_state()
     now = datetime.now()
 
-    candidates: List[Dict[str, Any]] = list(
+    all_candidates: List[Dict[str, Any]] = list(
         existing_table.rows_where(
             "has_content = 1 AND summary IS NULL",
             order_by="decision_date DESC",
         )
     )
-    remaining_total = len(candidates)
+    remaining_total = len(all_candidates)
     if remaining_total == 0:
         click.echo("Phase 3: no rows need summarisation.")
         return
 
-    alt_info = f", alt_model={model_alt}" if client_alt else ""
+    # Priority queue: quarantined docs (fail_count >= SUMMARY_MAX_RETRIES) fill first,
+    # then date-ordered fresh docs. Quarantined docs bypass the TTL check — they're
+    # here specifically to be retried on the (potentially updated) endpoint.
+    quarantined_ids = {
+        jid for jid, info in state.get("failures", {}).items()
+        if info.get("count", 0) >= SUMMARY_MAX_RETRIES
+    }
+    priority_docs = [r for r in all_candidates if r["id"] in quarantined_ids]
+    fresh_docs = [r for r in all_candidates if r["id"] not in quarantined_ids]
+    candidates = priority_docs + fresh_docs
+
     click.echo(
         f"Phase 3: summarising up to {SUMMARY_MAX_PER_RUN} / {remaining_total} "
-        f"remaining (model={model}{alt_info}, max_chars={SUMMARY_MAX_INPUT_CHARS})"
+        f"remaining (model={model}, max_chars={SUMMARY_MAX_INPUT_CHARS}, "
+        f"priority={len(priority_docs)})"
     )
     _phase3_log({"event": "start", "ts": datetime.now().isoformat(timespec="seconds"),
-                 "remaining": remaining_total, "model": model, "alt_model": model_alt or None})
+                 "remaining": remaining_total, "model": model,
+                 "priority_quarantined": len(priority_docs)})
 
     successes = 0
     cached_hits = 0
@@ -974,41 +976,30 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                 break
             jid = row["id"]
             fail_count = state.get("failures", {}).get(jid, {}).get("count", 0)
-            # Docs that have hit the primary failure cap route to the alt model
-            # (if configured) regardless of TTL — the point is to try a different
-            # model, not to wait. Without an alt client, apply normal quarantine.
-            use_alt = fail_count >= SUMMARY_MAX_RETRIES and client_alt is not None
-            if not use_alt and _is_summary_quarantined(state, jid, now):
+            # Quarantined docs (fail_count >= SUMMARY_MAX_RETRIES) bypass TTL —
+            # they were promoted to priority slots to be retried. Fresh docs still
+            # respect TTL to avoid hammering on transient failures.
+            if fail_count < SUMMARY_MAX_RETRIES and _is_summary_quarantined(state, jid, now):
                 skipped_quarantined += 1
                 continue
             attempted += 1
-            use_client = client_alt if use_alt else client
-            use_model = model_alt if use_alt else model
-            use_endpoint = os.environ.get("LLM_BASE_URL_2" if use_alt else "LLM_BASE_URL", "")
-            route_tag = " [alt]" if use_alt else ""
+            endpoint = os.environ.get("LLM_BASE_URL", "")
             label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
+            priority_tag = " [priority]" if jid in quarantined_ids else ""
             try:
-                status, detail = _summarise_row(
-                    row,
-                    existing_table,
-                    use_client,
-                    use_model,
-                    endpoint=use_endpoint,
-                    max_batches=max_batches_alt if use_alt else summarization._MAX_BATCHES,
-                    call_max_tokens_override=summarization._MAX_TOKENS_ALT if use_alt else 0,
-                )
+                status, detail = _summarise_row(row, existing_table, client, model, endpoint=endpoint)
             except Exception as exc:  # defensive
                 failures += 1
                 _record_summary_failure(state, jid, exc)
                 click.echo(
-                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → UNEXPECTED: {exc}",
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → UNEXPECTED: {exc}",
                     err=True,
                 )
                 _phase3_log({
                     "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
                     "n": attempted, "id": jid,
                     "citation": row.get("citation"), "court": row.get("court"),
-                    "status": "error", "detail": f"UNEXPECTED: {exc}", "alt": use_alt,
+                    "status": "error", "detail": f"UNEXPECTED: {exc}", "priority": bool(priority_tag),
                 })
                 save_summary_state(state)
                 continue
@@ -1016,24 +1007,24 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
             if status == "ok":
                 successes += 1
                 _clear_summary_failure(state, jid)
-                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → {detail}")
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → {detail}")
             elif status == "cached":
                 cached_hits += 1
                 _clear_summary_failure(state, jid)
-                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → cached")
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → cached")
             else:  # error
                 failures += 1
                 fake = RuntimeError(detail or "llm error")
                 _record_summary_failure(state, jid, fake)
                 click.echo(
-                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{route_tag} → llm failed: {detail}",
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → llm failed: {detail}",
                     err=True,
                 )
             _phase3_log({
                 "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
                 "n": attempted, "id": jid,
                 "citation": row.get("citation"), "court": row.get("court"),
-                "status": status, "detail": detail, "alt": use_alt,
+                "status": status, "detail": detail, "priority": bool(priority_tag),
             })
             save_summary_state(state)
     except KeyboardInterrupt:

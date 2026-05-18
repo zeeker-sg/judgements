@@ -134,28 +134,8 @@ def make_client():
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
-def make_client_alt():
-    """Build the alt OpenAI-compatible client for quarantine-routed docs, or None."""
-    base_url = os.environ.get("LLM_BASE_URL_2", "").strip()
-    if not base_url:
-        return None
-    from openai import OpenAI
-
-    api_key = (
-        os.environ.get("LLM_API_KEY_2", "").strip()
-        or os.environ.get("LLM_API_KEY", "").strip()
-        or "not-needed"
-    )
-    return OpenAI(base_url=base_url, api_key=api_key)
-
-
 def resolve_model(default: str = "llama3.1:8b") -> str:
     return os.environ.get("LLM_MODEL", "").strip() or default
-
-
-def resolve_model_alt() -> str:
-    primary = os.environ.get("LLM_MODEL", "").strip() or "llama3.1:8b"
-    return os.environ.get("LLM_MODEL_2", "").strip() or primary
 
 
 def _call_once(
@@ -212,12 +192,6 @@ def _render_fragment(frag: Dict[str, Any]) -> str:
 # ── Rolling summariser ────────────────────────────────────────────────────────
 
 _MAX_BATCHES = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_BATCHES", "20"))
-# Alt-model passes: fewer, wider batches — more fragments per call, fewer
-# rolling steps. DeepSeek V4 Flash handles ~50–100 frags/call comfortably.
-_MAX_BATCHES_ALT = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_BATCHES_ALT", "5"))
-# Alt-model output token floor — raised above 4096 so wide-batch intermediate
-# summaries have headroom. Also covers thinking tokens if the alt model uses them.
-_MAX_TOKENS_ALT = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_TOKENS_ALT", "8192"))
 
 
 def rolling_summarise(
@@ -228,7 +202,6 @@ def rolling_summarise(
     *,
     batch_size: int = 10,
     max_batches: int = _MAX_BATCHES,
-    call_max_tokens_override: int = 0,
     timeout: float = 300.0,
 ) -> str:
     """Two-pass rolling summariser. See module docstring for design notes.
@@ -253,10 +226,8 @@ def rolling_summarise(
     # Dynamic limit based on actual rendered fragment count.
     n_frags = row.get("fragment_count") or len(frag_texts)
     limit = max_summary_chars(n_frags)
-    # Scale token budget with the char limit — Gemma4:26b uses ~2 chars/token.
-    # Add 1024 overhead for thinking tokens that count against the same budget.
-    # call_max_tokens_override lets the alt model raise its floor independently.
-    call_max_tokens = call_max_tokens_override or max(4096, limit // 2 + 1024)
+    # Scale token budget with the char limit — ~2 chars/token + 1024 for thinking overhead.
+    call_max_tokens = max(4096, limit // 2 + 1024)
 
     # Cap at _MAX_BATCHES by widening batch_size for large docs.  For a
     # 957-frag judgment the default batch_size=10 yields 96 batches; with the
