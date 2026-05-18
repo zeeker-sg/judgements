@@ -47,6 +47,30 @@ from typing import Any, Dict, List
 _SUMMARY_BASE_CHARS = int(os.environ.get("JUDGMENTS_SUMMARY_BASE_CHARS", "4000"))
 _SUMMARY_CHARS_PER_100 = int(os.environ.get("JUDGMENTS_SUMMARY_CHARS_PER_100", "1000"))
 
+# ── Sampling parameters ──────────────────────────────────────────────────────
+#
+# Tuned for factual extraction from legal documents.
+#   temperature=0.0   → deterministic, no creativity
+#   top_p=0.9         → focused sampling
+#   frequency/presence penalty → reduce repetitive legal boilerplate
+#   seed (fixed)      → reproducible output for debugging
+#   repeat_penalty    → Ollama-specific repetition suppression
+#   top_k             → Ollama-specific token restriction
+#
+_SUMMARY_TEMPERATURE = float(os.environ.get("JUDGMENTS_SUMMARY_TEMPERATURE", "0.0"))
+_SUMMARY_TOP_P = float(os.environ.get("JUDGMENTS_SUMMARY_TOP_P", "0.9"))
+_SUMMARY_FREQUENCY_PENALTY = float(
+    os.environ.get("JUDGMENTS_SUMMARY_FREQUENCY_PENALTY", "0.15")
+)
+_SUMMARY_PRESENCE_PENALTY = float(
+    os.environ.get("JUDGMENTS_SUMMARY_PRESENCE_PENALTY", "0.1")
+)
+_SUMMARY_SEED = int(os.environ.get("JUDGMENTS_SUMMARY_SEED", "42"))
+_SUMMARY_REPEAT_PENALTY = float(
+    os.environ.get("JUDGMENTS_SUMMARY_REPEAT_PENALTY", "1.2")
+)
+_SUMMARY_TOP_K = int(os.environ.get("JUDGMENTS_SUMMARY_TOP_K", "20"))
+
 
 def max_summary_chars(fragment_count: int) -> int:
     """Return the character budget for a rolling summary given fragment count.
@@ -152,14 +176,26 @@ def _call_once(
     max_tokens: int = 2048,
     timeout: float = 120.0,
 ) -> str:
-    """Single OpenAI-compatible call. Raises ValueError on empty content."""
+    """Single OpenAI-compatible call. Raises ValueError on empty content.
+
+    Sampling tuned for factual extraction: low temperature, constrained top-p/top-k,
+    and penalties to suppress repetitive legal boilerplate.
+    """
     response = client.chat.completions.create(
         model=model,
         messages=messages,
         max_tokens=max_tokens,
-        temperature=0.2,
+        temperature=_SUMMARY_TEMPERATURE,
+        top_p=_SUMMARY_TOP_P,
+        frequency_penalty=_SUMMARY_FREQUENCY_PENALTY,
+        presence_penalty=_SUMMARY_PRESENCE_PENALTY,
+        seed=_SUMMARY_SEED,
         timeout=timeout,
-        extra_body={"think": False},
+        extra_body={
+            "think": False,
+            "repeat_penalty": _SUMMARY_REPEAT_PENALTY,
+            "top_k": _SUMMARY_TOP_K,
+        },
     )
     choice = response.choices[0]
     content = getattr(choice.message, "content", "") or ""
@@ -405,7 +441,7 @@ def summarise(
     *,
     timeout: float = 120.0,
     max_tokens: int = 4096,
-    temperature: float = 0.2,
+    temperature: float = _SUMMARY_TEMPERATURE,
 ) -> str:
     """Single-pass LLM call. No longer the primary path; retained for reference."""
     response = client.chat.completions.create(
@@ -416,8 +452,16 @@ def summarise(
         ],
         max_tokens=max_tokens,
         temperature=temperature,
+        top_p=_SUMMARY_TOP_P,
+        frequency_penalty=_SUMMARY_FREQUENCY_PENALTY,
+        presence_penalty=_SUMMARY_PRESENCE_PENALTY,
+        seed=_SUMMARY_SEED,
         timeout=timeout,
-        extra_body={"think": False},
+        extra_body={
+            "think": False,
+            "repeat_penalty": _SUMMARY_REPEAT_PENALTY,
+            "top_k": _SUMMARY_TOP_K,
+        },
     )
     choice = response.choices[0]
     content = getattr(choice.message, "content", "") or ""

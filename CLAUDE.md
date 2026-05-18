@@ -381,6 +381,13 @@ vars (handy for smoke tests — no code edits required):
 | `LLM_MODEL_2` | same as `LLM_MODEL` | Phase 3: model name on the alt endpoint. |
 | `JUDGMENTS_SUMMARY_MAX_BATCHES_ALT` | `5` | Phase 3: rolling-pass cap for alt-model calls. Fewer, wider batches (vs 20 for primary) — alt model handles more fragments per call. |
 | `JUDGMENTS_SUMMARY_MAX_TOKENS_ALT` | `8192` | Phase 3: output token floor for alt-model calls. Raised above 4096 to handle wide-batch intermediate summaries and any thinking tokens the alt model uses. |
+| `JUDGMENTS_SUMMARY_TEMPERATURE` | `0.0` | Phase 3: sampling temperature. 0.0 = deterministic extraction, no creativity. |
+| `JUDGMENTS_SUMMARY_TOP_P` | `0.9` | Phase 3: nucleus sampling ceiling. Limits generation to top 90% probability mass. |
+| `JUDGMENTS_SUMMARY_FREQUENCY_PENALTY` | `0.15` | Phase 3: reduces repetition of the same phrases across the summary. |
+| `JUDGMENTS_SUMMARY_PRESENCE_PENALTY` | `0.1` | Phase 3: discourages restating the same concept in different wording. |
+| `JUDGMENTS_SUMMARY_SEED` | `42` | Phase 3: fixed random seed. Re-run the same doc → identical output (for debugging). |
+| `JUDGMENTS_SUMMARY_REPEAT_PENALTY` | `1.2` | Phase 3: Ollama-specific repetition suppression (via `extra_body`). |
+| `JUDGMENTS_SUMMARY_TOP_K` | `20` | Phase 3: Ollama-specific token restriction (via `extra_body`). |
 
 ### Operational notes
 - **Phase 1 checkpointing:** state lives in
