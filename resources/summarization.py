@@ -138,6 +138,12 @@ def resolve_model(default: str = "llama3.1:8b") -> str:
     return os.environ.get("LLM_MODEL", "").strip() or default
 
 
+def resolve_model_alt() -> str:
+    """Return LLM_MODEL_2 if set, otherwise fall back to LLM_MODEL."""
+    primary = os.environ.get("LLM_MODEL", "").strip() or "llama3.1:8b"
+    return os.environ.get("LLM_MODEL_2", "").strip() or primary
+
+
 def _call_once(
     messages: List[Dict[str, str]],
     model: str,

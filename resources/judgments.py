@@ -929,6 +929,7 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
 
     _ensure_phase3_columns(existing_table)
     model = summarization.resolve_model()
+    model_alt = summarization.resolve_model_alt()
 
     state = load_summary_state()
     now = datetime.now()
@@ -955,13 +956,14 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
     fresh_docs = [r for r in all_candidates if r["id"] not in quarantined_ids]
     candidates = priority_docs + fresh_docs
 
+    alt_label = f", alt_model={model_alt}" if model_alt != model else ""
     click.echo(
         f"Phase 3: summarising up to {SUMMARY_MAX_PER_RUN} / {remaining_total} "
-        f"remaining (model={model}, max_chars={SUMMARY_MAX_INPUT_CHARS}, "
+        f"remaining (model={model}{alt_label}, max_chars={SUMMARY_MAX_INPUT_CHARS}, "
         f"priority={len(priority_docs)})"
     )
     _phase3_log({"event": "start", "ts": datetime.now().isoformat(timespec="seconds"),
-                 "remaining": remaining_total, "model": model,
+                 "remaining": remaining_total, "model": model, "model_alt": model_alt,
                  "priority_quarantined": len(priority_docs)})
 
     successes = 0
@@ -984,10 +986,12 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                 continue
             attempted += 1
             endpoint = os.environ.get("LLM_BASE_URL", "")
+            is_priority = jid in quarantined_ids
+            use_model = model_alt if is_priority else model
             label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
-            priority_tag = " [priority]" if jid in quarantined_ids else ""
+            priority_tag = " [alt-model]" if is_priority else ""
             try:
-                status, detail = _summarise_row(row, existing_table, client, model, endpoint=endpoint)
+                status, detail = _summarise_row(row, existing_table, client, use_model, endpoint=endpoint)
             except Exception as exc:  # defensive
                 failures += 1
                 _record_summary_failure(state, jid, exc)
@@ -999,7 +1003,8 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                     "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
                     "n": attempted, "id": jid,
                     "citation": row.get("citation"), "court": row.get("court"),
-                    "status": "error", "detail": f"UNEXPECTED: {exc}", "priority": bool(priority_tag),
+                    "status": "error", "detail": f"UNEXPECTED: {exc}",
+                    "model": use_model, "alt": is_priority,
                 })
                 save_summary_state(state)
                 continue
@@ -1024,7 +1029,8 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                 "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
                 "n": attempted, "id": jid,
                 "citation": row.get("citation"), "court": row.get("court"),
-                "status": status, "detail": detail, "priority": bool(priority_tag),
+                "status": status, "detail": detail,
+                "model": use_model, "alt": is_priority,
             })
             save_summary_state(state)
     except KeyboardInterrupt:
