@@ -42,6 +42,8 @@ import os
 import re
 from typing import Any, Dict, List
 
+import httpx
+
 # ── Dynamic length limit ─────────────────────────────────────────────────────
 
 _SUMMARY_BASE_CHARS = int(os.environ.get("JUDGMENTS_SUMMARY_BASE_CHARS", "4000"))
@@ -145,6 +147,40 @@ _META_PREFIX_RE = re.compile(
 )
 
 
+# ── Token usage tracking ─────────────────────────────────────────────────────
+
+import json
+from datetime import datetime, timezone
+
+_TOKEN_LOG_PATH = os.path.expanduser("~/.config/zeeker/token_usage.jsonl")
+
+
+def _log_token_usage(
+    *,
+    endpoint: str,
+    model: str,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    call_type: str = "summary",
+) -> None:
+    """Append a token-usage record to the shared JSONL log."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent": "zeeker-judgements",
+        "endpoint": endpoint,
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "call_type": call_type,
+    }
+    try:
+        os.makedirs(os.path.dirname(_TOKEN_LOG_PATH), exist_ok=True)
+        with open(_TOKEN_LOG_PATH, "a") as fh:
+            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError:
+        pass  # Fail silently — token tracking is non-critical
+
+
 # ── LLM helpers ──────────────────────────────────────────────────────────────
 
 def make_client():
@@ -155,7 +191,7 @@ def make_client():
     from openai import OpenAI
 
     api_key = os.environ.get("LLM_API_KEY", "").strip() or "not-needed"
-    return OpenAI(base_url=base_url, api_key=api_key)
+    return OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
 
 
 def resolve_model(default: str = "llama3.1:8b") -> str:
@@ -168,6 +204,54 @@ def resolve_model_alt() -> str:
     return os.environ.get("LLM_MODEL_2", "").strip() or primary
 
 
+def _call_once_native_ollama(
+    messages: List[Dict[str, str]],
+    model: str,
+    base_url: str,
+    *,
+    max_tokens: int = 2048,
+    timeout: float = 120.0,
+) -> str:
+    """Native Ollama /api/chat call.
+
+    Bypasses the OpenAI-compatible layer so ``num_ctx`` and ``num_predict``
+    are respected directly. Uses a hard wall-clock timeout (total timeout in
+    httpx) so a stalled stream cannot hang the build.
+    """
+    url = base_url.rstrip("/").removesuffix("/v1") + "/api/chat"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "options": {
+            "num_ctx": 128000,
+            "num_predict": max_tokens,
+            "temperature": _SUMMARY_TEMPERATURE,
+            "top_p": _SUMMARY_TOP_P,
+            "repeat_penalty": _SUMMARY_REPEAT_PENALTY,
+            "top_k": _SUMMARY_TOP_K,
+            "seed": _SUMMARY_SEED,
+        },
+        "think": False,
+        "stream": False,
+    }
+    with httpx.Client(timeout=timeout) as http:
+        resp = http.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    content = (data.get("message", {}).get("content") or "").strip()
+    if not content:
+        done_reason = data.get("done_reason", "unknown")
+        raise ValueError(f"LLM returned empty content (done_reason={done_reason})")
+    _log_token_usage(
+        endpoint="ollama",
+        model=model,
+        prompt_tokens=data.get("prompt_eval_count"),
+        completion_tokens=data.get("eval_count"),
+        call_type="summary",
+    )
+    return content
+
+
 def _call_once(
     messages: List[Dict[str, str]],
     model: str,
@@ -176,11 +260,21 @@ def _call_once(
     max_tokens: int = 2048,
     timeout: float = 120.0,
 ) -> str:
-    """Single OpenAI-compatible call. Raises ValueError on empty content.
+    """Single LLM call.
+
+    Dispatches to the native Ollama API when the endpoint looks like an Ollama
+    server (base URL ends with ``/v1``), otherwise uses the OpenAI-compatible
+    client. Raises ValueError on empty content.
 
     Sampling tuned for factual extraction: low temperature, constrained top-p/top-k,
     and penalties to suppress repetitive legal boilerplate.
     """
+    base_url = str(getattr(client, "base_url", ""))
+    if base_url.rstrip("/").endswith("/v1"):
+        return _call_once_native_ollama(
+            messages, model, base_url, max_tokens=max_tokens, timeout=timeout
+        )
+
     response = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -196,6 +290,14 @@ def _call_once(
             "repeat_penalty": _SUMMARY_REPEAT_PENALTY,
             "top_k": _SUMMARY_TOP_K,
         },
+    )
+    usage = getattr(response, "usage", None)
+    _log_token_usage(
+        endpoint="openai-compatible",
+        model=model,
+        prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+        completion_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+        call_type="summary",
     )
     choice = response.choices[0]
     content = getattr(choice.message, "content", "") or ""
@@ -289,16 +391,24 @@ def rolling_summarise(
         else:
             user_msg = _ROLLING_CONTINUE.format(summary=summary, text=text, limit=limit)
 
-        summary = _call_once(
-            messages=[
-                {"role": "system", "content": ROLLING_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            model=model,
-            client=client,
-            max_tokens=call_max_tokens,
-            timeout=timeout,
-        )
+        try:
+            summary = _call_once(
+                messages=[
+                    {"role": "system", "content": ROLLING_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                model=model,
+                client=client,
+                max_tokens=call_max_tokens,
+                timeout=timeout,
+            )
+        except ValueError:
+            if i == 0:
+                raise
+            # Continuation failed (model returns empty content on this prompt).
+            # Return the best summary we have so far — first-batch coverage is usually enough.
+            break
+
         # Prevent uncapped growth: _call_once returns partial content on finish_reason=length.
         # Without this guard, accumulated summary can reach 5k–20k tokens → overflows num_ctx
         # in the sanity-check pass (input=0 output tokens, content="", finish_reason=length).
