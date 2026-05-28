@@ -92,7 +92,21 @@ Build a structured summary covering three sections:
 **Holding** — what the court decided
 **Reasons** — the main legal reasoning, principles applied, and cases cited
 
-Write in plain prose under those three headings. Be concise and information-dense."""
+Write in plain prose under those three headings. Be concise and information-dense.
+
+Do not conflate cited cases with the case before the court. Other named cases \
+and their parties are precedents the court discusses; their facts, holdings, and \
+monetary awards belong under **Reasons** (as authority applied, distinguished, or \
+overruled), never under **Facts** or **Holding**. **Facts** and **Holding** \
+describe only the dispute and decision in the present judgment.{anchor}"""
+
+# Per-row anchor appended to the system prompt so every batch call knows which
+# case is "the present case" — the model cannot otherwise tell the current
+# dispute from a heavily-discussed precedent. See Issue #1 (JGP v JGQ).
+_ROLLING_ANCHOR = """
+
+The present case you are summarising is: {case}. Any other case name or party \
+you encounter in the excerpts is a cited precedent, not the present dispute."""
 
 _ROLLING_FIRST = """\
 Here are the opening excerpts from a Singapore court judgment. Begin building your summary.
@@ -383,6 +397,15 @@ def rolling_summarise(
     batches = [frag_texts[i : i + effective_batch] for i in range(0, len(frag_texts), effective_batch)]
     summary = ""
 
+    # Build the per-row system prompt with a case anchor so every batch knows
+    # which case is "the present case" (defends against conflating a heavily
+    # cited precedent into Facts/Holding — Issue #1, JGP v JGQ).
+    case_name = (row.get("case_name") or "").strip()
+    citation = (row.get("citation") or "").strip()
+    case_label = " ".join(p for p in (case_name, citation) if p)
+    anchor = _ROLLING_ANCHOR.format(case=case_label) if case_label else ""
+    system_prompt = ROLLING_SYSTEM_PROMPT.format(anchor=anchor)
+
     # Pass 1: rolling
     for i, batch in enumerate(batches):
         text = "\n\n---\n\n".join(batch)
@@ -394,7 +417,7 @@ def rolling_summarise(
         try:
             summary = _call_once(
                 messages=[
-                    {"role": "system", "content": ROLLING_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg},
                 ],
                 model=model,
