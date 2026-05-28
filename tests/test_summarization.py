@@ -321,10 +321,12 @@ class TestSummariseRow:
         # as the top-level module "summarization". That is a DIFFERENT
         # module object from resources.summarization. Patch the one the
         # code under test actually calls into: judgments_mod.summarization.
+        # _summarise_row calls rolling_summarise(row, fragments, model, client),
+        # so that is the function to stub.
         monkeypatch.setattr(
             judgments_mod.summarization,
-            "summarise",
-            lambda input_text, model, client, **kwargs: ("Stub summary paragraph of the judgment."),
+            "rolling_summarise",
+            lambda row, fragments, model, client, **kwargs: ("Stub summary paragraph of the judgment."),
         )
         # summary_cache is likewise a separate module object; use the
         # one judgments_mod imported so its writes land in our tmp dir.
