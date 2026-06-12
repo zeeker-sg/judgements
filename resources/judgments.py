@@ -870,6 +870,7 @@ def _summarise_row(
                 or datetime.now().isoformat(timespec="seconds"),
             },
         )
+        existing_table.db.conn.commit()
         return "cached", None
 
     fragments = (
@@ -908,6 +909,7 @@ def _summarise_row(
         jid,
         {"summary": summary_text, "summary_generated_at": now_iso},
     )
+    existing_table.db.conn.commit()
     return "ok", f"{len(summary_text)} chars"
 
 
@@ -927,6 +929,7 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
         click.echo("Phase 3: LLM not configured (LLM_BASE_URL unset) — skipping.")
         return
 
+    client_alt = summarization.make_client_alt()
     _ensure_phase3_columns(existing_table)
     model = summarization.resolve_model()
     model_alt = summarization.resolve_model_alt()
@@ -985,13 +988,14 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                 skipped_quarantined += 1
                 continue
             attempted += 1
-            endpoint = os.environ.get("LLM_BASE_URL", "")
             is_priority = jid in quarantined_ids
             use_model = model_alt if is_priority else model
+            use_client = client_alt if (is_priority and client_alt is not None) else client
+            endpoint = os.environ.get("LLM_BASE_URL_2" if (is_priority and client_alt is not None) else "LLM_BASE_URL", "")
             label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
             priority_tag = " [alt-model]" if is_priority else ""
             try:
-                status, detail = _summarise_row(row, existing_table, client, use_model, endpoint=endpoint)
+                status, detail = _summarise_row(row, existing_table, use_client, use_model, endpoint=endpoint)
             except Exception as exc:  # defensive
                 failures += 1
                 _record_summary_failure(state, jid, exc)

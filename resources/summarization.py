@@ -152,7 +152,9 @@ _META_PREFIX_RE = re.compile(
 import json
 from datetime import datetime, timezone
 
-_TOKEN_LOG_PATH = os.path.expanduser("~/.config/zeeker/token_usage.jsonl")
+_TOKEN_LOG_PATH = os.environ.get(
+    "ZEEKER_TOKEN_LOG", "/workspace/agent/token_usage.jsonl"
+)
 
 
 def _log_token_usage(
@@ -191,6 +193,17 @@ def make_client():
     from openai import OpenAI
 
     api_key = os.environ.get("LLM_API_KEY", "").strip() or "not-needed"
+    return OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+
+
+def make_client_alt():
+    """Build an alt OpenAI-compatible client, or return None when unconfigured."""
+    base_url = os.environ.get("LLM_BASE_URL_2", "").strip()
+    if not base_url:
+        return None
+    from openai import OpenAI
+
+    api_key = os.environ.get("LLM_API_KEY_2", "").strip() or os.environ.get("LLM_API_KEY", "").strip() or "not-needed"
     return OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
 
 
@@ -270,7 +283,9 @@ def _call_once(
     and penalties to suppress repetitive legal boilerplate.
     """
     base_url = str(getattr(client, "base_url", ""))
-    if base_url.rstrip("/").endswith("/v1"):
+    ollama_url = os.environ.get("LLM_BASE_URL", "").strip()
+    is_ollama = base_url.rstrip("/").endswith("/v1") and base_url == ollama_url
+    if is_ollama:
         return _call_once_native_ollama(
             messages, model, base_url, max_tokens=max_tokens, timeout=timeout
         )
