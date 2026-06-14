@@ -2,41 +2,68 @@
 name = "zeeker-judgements"
 database = "zeeker-judgements.db"
 title = "Singapore Court Judgments"
-description = "Searchable catalog of Singapore court judgments from eLitigation, covering SGCA, SGHC, SGHCF, SGDC, SGFC, SGMC and specialist tribunals back to 2000."
-license = "© Government of Singapore"
-license_url = "https://www.elitigation.sg/gd/"
-source = "https://www.elitigation.sg/gd/"
+description = "Non-commercial catalogue of Singapore court judgments from the Singapore Courts' free judgments portal on eLitigation (https://www.elitigation.sg/gd/): case metadata and AI-generated research summaries, with a link back to each judgment. Covers SGCA, SGHC, SGHCA, SGHCF, SGHCR, SGDC, SGFC, SGMC, and tribunals such as SGCDT and SGSCT — the crawler accepts any SG* court code that appears on the portal's listing — back to 2000. Full judgment text is collected for indexing and summarisation, but access to it is not provided through this catalogue — read each judgment at its source_url, where the PDF copy is the authoritative version (eLitigation warns its web-converted HTML 'may have created formatting or alignment issues'). Judgments are © Government of Singapore; reproduction and reuse are governed by the Singapore Courts Terms of Use (https://www.judiciary.gov.sg/terms-of-use). This project is not affiliated with, and is not endorsed by, the Singapore Courts, the Judiciary, or eLitigation. Summaries in the summary column are AI-generated research aids, are not part of the judgment, and may contain errors."
+license = "© Government of Singapore. Judgments reproduced from the Singapore Courts' free judgments portal on eLitigation (https://www.elitigation.sg/gd/); reproduction and reuse are governed by the Singapore Courts Terms of Use."
+license_url = "https://www.judiciary.gov.sg/terms-of-use"
+source = "eLitigation — Singapore Courts' free judgments portal (https://www.elitigation.sg/gd/)"
+source_url = "https://www.elitigation.sg/gd/"
 
 [resource.judgments]
-description = "Singapore court judgments — catalog metadata (Phase 1), full judgment text and court-authored summary (Phase 2), and AI-generated single-paragraph summaries (Phase 3). Paragraph-level fragments live in judgments_fragments."
+description = "One row per judgment. Built in three phases: Phase 1 (discovery) scrapes listing pages for catalog metadata; Phase 2 (enrichment) extracts the full judgment body from the detail page's div#divJudgement into content_text plus per-paragraph rows in judgments_fragments, and captures the court-issued summary from div#divCaseSummary; Phase 3 generates an AI research summary (Facts / Holding / Reasons) with a rolling two-pass LLM pipeline. Backfill is incremental, so during it many rows have content_text IS NULL (not yet extracted) and summary IS NULL (not yet summarised). The HTML source is eLitigation's mobile/web conversion of the judgment — the PDF at pdf_url is the authoritative version."
 facets = ["court", "decision_date", "has_content"]
-sort = "decision_date desc"
+sort_desc = "decision_date"
+label_column = "case_name"
 size = 25
 # Phase 2 is live: each build enriches up to JUDGMENTS_EXTRACT_MAX_PER_RUN
 # rows (default 15) whose content_text is NULL, parsing HTML from the
 # detail page and emitting per-paragraph rows into judgments_fragments.
 # The on-disk extraction cache under .cache/ is the source of truth that
 # survives zeeker's module reload between main-table and fragment phases.
+#
+# Main-table FTS covers catalog/summary fields only; full-judgment text
+# search runs on the fragments FTS index (fragments_fts_fields below),
+# which indexes every paragraph's content_text.
 fragments = true
 fts_fields = ["case_name", "summary", "court_summary"]
 fragments_fts_fields = ["content_text"]
 
 [resource.judgments.columns]
-id = "Opaque SHA-256 hash of source_url (first 12 hex chars). Stable identifier for deduplication."
-citation = "Neutral citation, e.g. [2026] SGHC 61. Content field for search/display — do not use as ID."
-case_name = "Case name as shown on the listing, e.g. NG KAI HOE RAYMOND v Wong Peng Kong."
-case_numbers = "Court file reference numbers, pipe-separated when multiple."
-decision_date = "Date the judgment was delivered (ISO 8601: YYYY-MM-DD)."
-court = "Court abbreviation parsed from the source URL: SGCA (Court of Appeal), SGHC (High Court), SGHCA (High Court Appellate Div), SGHCF (High Court Family), SGHCR (High Court Registrar), SGDC (District Court), SGFC (Family Court), SGMC (Magistrate's Court), SGCDT (Community Disputes Tribunal), SGSCT (Small Claims Tribunal), plus any future SG* codes."
-subject_tags = "JSON array of catchwords from eLitigation's hierarchical subject classification."
-source_url = "URL to the judgment HTML on eLitigation."
-pdf_url = "URL to the authoritative PDF version at /gd/gd/{citation}/pdf (percent-encoded). Stored as a reference to the legally authoritative format; Phase 2 extraction uses the HTML at source_url instead."
-content_text = "Full judgment body text, composed from the numbered paragraphs and headings in div#divJudgement. Populated by Phase 2. NULL means 'not yet extracted'; empty string means 'extraction ran but the detail page had no extractable body' (see has_content)."
-court_summary = "Court-authored summary from div#divCaseSummary when present (often empty). Populated by Phase 2."
-summary = "AI-generated paragraph (≤100 words) highlighting the court, parties, issues, holding, and cited precedents. Populated by Phase 3 from an OpenAI-compatible LLM endpoint (e.g. Ollama). NULL until Phase 3 runs for this row."
-has_content = "True if Phase 2 extraction produced a non-empty judgment body; False if the source page had no divJudgement body. Lets Datasette filters distinguish 'extraction succeeded' from 'not yet extracted' (content_text IS NULL)."
-has_court_summary = "True if the source page's divCaseSummary was non-empty."
-fragment_count = "Number of rows in judgments_fragments for this judgment."
-extracted_at = "ISO 8601 timestamp when Phase 2 enrichment ran for this row."
-summary_generated_at = "ISO 8601 timestamp when Phase 3 generated this summary."
-created_at = "ISO 8601 timestamp when the record was first imported (Phase 1)."
+id = "Opaque SHA-256 hash of source_url (first 12 hex chars). Stable row identifier; judgments_fragments.judgment_id points here. Never derived from the citation."
+citation = "Neutral citation as shown on the listing card, e.g. '[2026] SGHC 61'. Content field for search/display, never a key. Empty string when the listing card carried no citation."
+case_name = "Case name from the listing card's title link, e.g. 'NG KAI HOE RAYMOND v Wong Peng Kong'. Listing entries without a case name are skipped at discovery, so this is always non-empty."
+case_numbers = "Court file reference numbers from the listing card, joined with ' | ' when a judgment has several. Empty string when the card shows none."
+decision_date = "Date the judgment was delivered (ISO 8601 YYYY-MM-DD), parsed from the listing card's machine-readable DecisionDate search parameter, with the visible 'Decision Date: 17 Apr 2026' text as fallback. Empty string when neither parses."
+court = "Court code parsed from the source URL pattern /gd/s/{year}_{CODE}_{n}; any SG[A-Z]+ token is accepted. Seen codes: SGCA (Court of Appeal), SGHC (General Division, High Court), SGHCA (Appellate Division), SGHCF (Family Division), SGHCR (High Court Registrar), SGDC (District Court), SGFC (Family Court), SGMC (Magistrates' Court), SGCDT (Community Disputes Resolution Tribunals), SGSCT (Small Claims Tribunal), plus any other SG* code eLitigation publishes. Empty string when the URL does not match the pattern."
+subject_tags = "JSON array of catchwords from eLitigation's hierarchical subject classification, outer brackets stripped, e.g. [\"Criminal Procedure and Sentencing — Sentencing\"]. '[]' when the listing card shows none."
+source_url = "Absolute URL of the judgment's HTML detail page on eLitigation (/gd/s/{year}_{COURT}_{n}). Every row links back to its source; id is derived from this value."
+pdf_url = "Absolute URL of the judgment PDF at /gd/gd/{citation}/pdf, with the bracketed citation segment percent-encoded. The PDF is the authoritative version of the judgment — the HTML at source_url is eLitigation's web conversion. Empty string when no citation could be parsed to build it."
+content_text = "Full judgment body text, composed in document order from the per-paragraph fragments parsed out of div#divJudgement; numbered paragraphs keep their paragraph number as a prefix, and non-breaking/em spaces are normalised to plain spaces. Tables appear inline as pipe-separated rows between '---table---' and '---end-table---' markers; figures appear as their alt text or a '[Figure, WxH]' placeholder. NULL means 'not yet extracted' (Phase 2 pending); empty string means 'extraction ran but the page had no extractable judgment body' (see has_content). Per-paragraph structure lives in judgments_fragments. Derived from eLitigation's web-converted HTML — the PDF at pdf_url is authoritative."
+court_summary = "Court-issued case summary from the detail page's div#divCaseSummary, whitespace-normalised. The courts publish these for selected judgments only. NULL means Phase 2 has not run for this row; empty string means the page had no case summary (the common case)."
+summary = "AI-generated research summary structured under Facts / Holding / Reasons headings, produced by a rolling two-pass LLM pipeline: pass 1 reads every fragment in document order a batch at a time, updating a running summary; pass 2 condenses any over-length draft. The length budget is dynamic — 4,000 characters as the base, plus 1,000 for each full additional 100 fragments beyond the first 100. Generated by an OpenAI-compatible LLM endpoint configured at run time (LLM_BASE_URL/LLM_MODEL; default model llama3.1:8b); the model is environment-dependent, so different rows may have been generated by different models. NOT part of the judgment, not reviewed by any court, and may contain errors — verify against content_text and the authoritative PDF. NULL until Phase 3 runs for this row."
+created_at = "ISO 8601 timestamp when the catalog row was first discovered from the listing (Phase 1)."
+has_content = "1 if Phase 2 extraction produced a non-empty judgment body, 0 if the page had no extractable div#divJudgement content (INTEGER 0/1). NULL means Phase 2 has not reached this row yet — so this column distinguishes 'extraction ran, nothing there' (0) from 'not yet extracted' (NULL, content_text IS NULL)."
+has_court_summary = "1 if the source page's div#divCaseSummary was present and non-empty, 0 otherwise (INTEGER 0/1). NULL until Phase 2 runs for this row."
+fragment_count = "Number of rows in judgments_fragments for this judgment, written by Phase 2. 0 for structurally empty pages; NULL until Phase 2 runs for this row."
+extracted_at = "ISO 8601 timestamp of the Phase 2 enrichment that produced this row's content_text and fragments. NULL until Phase 2 runs for this row."
+summary_generated_at = "ISO 8601 timestamp when Phase 3 generated this row's summary. NULL until then; the column itself is only added to the schema the first time Phase 3 runs, so it may be absent from a freshly bootstrapped database."
+
+[resource.judgments_fragments]
+description = "One row per Judg-* element of each extracted judgment — numbered paragraphs, lettered and roman sub-paragraphs, headings, quotes, list items, counsel and hearing-date blocks — in document order. This is the substrate for full-text search (every fragment's content_text is FTS-indexed) and the input the AI summariser reads. Rows are written by the judgments resource's Phase 2 (resources/judgments.py), not by this stub; ids are deterministic and inserts use INSERT OR IGNORE, so re-runs never duplicate rows. Text derives from eLitigation's web-converted HTML; html_raw preserves the source markup verbatim."
+facets = ["class_name", "has_footnotes", "has_table", "has_figure"]
+sort = "ordinal"
+
+[resource.judgments_fragments.columns]
+id = "'{judgment_id}_{ordinal:04d}' — the parent judgment's 12-hex id plus the zero-padded document-order ordinal, e.g. '6c80a0a35b9f_0042'. Deterministic from document structure, so crash re-runs INSERT OR IGNORE without duplicating."
+judgment_id = "Reference to judgments.id (semantic FK — indexed, but SQLite does not enforce it)."
+ordinal = "0-based position of this element within the judgment. Sorting by ordinal reconstitutes reading order; also the order the AI summariser consumes fragments in."
+paragraph_number = "Arabic paragraph number split off the leading token of Judg-1/Judg-1-firstpara elements — the official pinpoint-citation number, e.g. 42. NULL for every other class (headings, lettered Judg-2 and roman Judg-3 sub-paragraphs, quotes, lists, etc.) and for Judg-1 elements whose text does not begin with a parseable number."
+class_name = "The eLitigation Judg-* CSS class of the source element, e.g. Judg-1 (numbered paragraph), Judg-1-firstpara, Judg-2 (lettered sub-paragraph), Judg-3 (roman sub-sub-paragraph), Judg-Heading-1 through Judg-Heading-5 (nested section headings), Judg-Quote-*, Judg-List-*, Judg-Hearing-Date. Detection is prefix-based so era-specific variants are preserved as-is; the Judg-EOF end-of-document ornament is excluded entirely."
+section_heading = "Text of the most recent preceding Judg-Heading-* element, carried onto every following fragment so paragraphs are searchable by the section they sit under. NULL for fragments before the first heading and for heading rows themselves."
+content_text = "Whitespace-normalised text of the element (non-breaking and em spaces become plain spaces). Tables — whether nested in the element or standalone siblings attached to the nearest Judg-1/Judg-2/Judg-3 anchor paragraph — are rendered as pipe-separated rows wrapped in '---table---'/'---end-table---' markers; figures contribute their alt text or a synthesised '[Figure, WxH]' placeholder so FTS has something to match. For numbered paragraphs the leading number is split off into paragraph_number. Tables and images never get standalone rows of their own."
+html_raw = "Verbatim HTML of the source element as served by eLitigation — the lossless fallback when the text rendering drops something (table layout, inline styling, data-URI images)."
+footnote_text = "JSON array of resolved footnote body texts, in the order their superscript references appear in this element. Resolved from the page's div[id^='fn'] containers via both markup variants eLitigation uses (modal buttons on newer judgments, plain anchors on older ones). NULL when the element references no footnotes."
+has_footnotes = "1 if footnote_text is populated, 0 otherwise (INTEGER 0/1)."
+has_table = "1 if at least one non-empty table was absorbed into this fragment's content_text (nested or attached orphan), 0 otherwise (INTEGER 0/1)."
+has_figure = "1 if at least one image was absorbed into this fragment, 0 otherwise (INTEGER 0/1). See figure_src and figure_descriptions."
+figure_src = "JSON array of image sources for absorbed figures: the raw src URL for ordinary images, or 'sha256:<hex>' — a SHA-256 digest of the full data: URI — for inline base64 images, so multi-megabyte blobs never enter the database. NULL when the fragment has no figures."
+figure_descriptions = "JSON array of figure alt texts, parallel to figure_src. When the markup has no alt text a placeholder is synthesised from the image dimensions, e.g. '[Figure, 624x312]', or the bare '[Figure]'. NULL when the fragment has no figures."
