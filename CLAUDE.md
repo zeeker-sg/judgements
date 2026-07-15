@@ -463,5 +463,43 @@ vars (handy for smoke tests — no code edits required):
 
 ---
 
-This file is automatically created by Zeeker and can be customized for your project's needs.
-The main Zeeker development guide is in the repository root CLAUDE.md file.
+## Build Monitoring Guide (for AI agents)
+
+This section helps AI agents monitoring the build pipeline interpret log output correctly.
+
+### What "no data returned" means for this repo
+
+The `judgments` resource is a **3-phase pipeline** that does real work even when SUMMARY says "0 succeeded":
+
+| Phase | What it does | Log signal | Shows in SUMMARY? |
+|-------|-------------|------------|-------------------|
+| Phase 1 (discovery) | Scrape eLitigation listing pages for new judgment metadata | `Discovery run complete: N new records` | Yes — counted as "succeeded" if N > 0 |
+| Phase 2 (enrichment) | Fetch full HTML for existing rows with NULL content_text, extract paragraphs | `Phase 2 complete: N extracted, ... M NULL-content rows remain` | **No** — runs inside the same fetch_data() call but doesn't count as "succeeded" |
+| Phase 3 (summarisation) | LLM-generate summaries for rows with NULL summary | `Phase 3 complete: N summarised, ... m NULL-summary rows remain` | **No** — same reason |
+
+**Typical healthy build:** `SUMMARY: 1 succeeded, 0 failed, 0 skipped` with Phase 2 extracting 25 rows and Phase 3 summarising 25 rows. The "1 succeeded" is the discovery phase finding 1 new judgment. The 50 rows of enrichment work are invisible in SUMMARY.
+
+**"No data returned" is normal when:** Discovery found 0 new judgments (steady-state — all recent cases already in DB). Phase 2 and Phase 3 still run and process the backlog.
+
+**"No data returned" is abnormal when:** The eLitigation site is unreachable (network error, timeout). Check for `Connection error`, `RetryError`, `timeout` in the log.
+
+### Normal yield expectations
+
+- **New judgments:** 0–5 per day (court sitting days only — typically 1–3 on weekdays, 0 on weekends)
+- **Phase 2 enrichment:** 25 rows per run (EXTRACT_MAX_PER_RUN=25). Backlog: ~8,740 rows still NULL → ~350 days at 1 run/day
+- **Phase 3 summarisation:** 25 rows per run (SUMMARISE_MAX_PER_RUN=25). Backlog: ~884 rows still NULL → ~35 days at 1 run/day
+- **Build duration:** 30–45 minutes (dominated by Phase 2+3 LLM calls, not discovery)
+
+### Current DB stats (as of Jul 2026)
+
+- Total judgments: ~10,683
+- With content_text (enriched): ~1,943 (18%)
+- With summary (summarised): ~9,799 (92%)
+- Fragment rows: growing with each Phase 2 run
+
+### Failure modes to watch for
+
+1. **LLM endpoint down** — Phase 3 shows `llm failed: InternalServerError: Error code: 500`. Transient — retries next run.
+2. **eLitigation site down** — Phase 1 shows `Connection error` or `RetryError`. All subsequent phases skip.
+3. **Build duration > 1h** — Usually means Phase 2/3 are processing but LLM is slow. Not a failure unless > 2h.
+4. **`Phase 2: already ran this build` — skipping`** — Normal. Zeeker calls fetch_data() twice (once for main, once for fragments). The second call detects it already ran and skips.

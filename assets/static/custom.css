@@ -1,0 +1,37 @@
+/* Custom styles for zeeker-judgements database */
+/* Following Zeeker customization guide patterns */
+
+/* CSS Custom Properties for theming */
+:root {
+    --color-accent-primary: #3498db;
+    --color-accent-secondary: #e74c3c;
+}
+
+/* Scope to your database to avoid conflicts (per guide) */
+[data-database="zeeker-judgements"] {
+    /* Database-specific styles here */
+}
+
+/* Database-specific header styling */
+.page-database[data-database="zeeker-judgements"] .database-title {
+    color: var(--color-accent-primary);
+    text-shadow: 0 2px 4px rgba(52, 152, 219, 0.3);
+}
+
+/* Custom table styling */
+.page-database[data-database="zeeker-judgements"] .card {
+    border-left: 4px solid var(--color-accent-primary);
+    transition: transform 0.2s ease;
+}
+
+.page-database[data-database="zeeker-judgements"] .card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .page-database[data-database="zeeker-judgements"] .database-title {
+        font-size: 1.5rem;
+    }
+}
