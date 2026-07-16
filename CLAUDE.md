@@ -370,8 +370,9 @@ vars (handy for smoke tests — no code edits required):
 | `JUDGMENTS_SUMMARY_ENABLED` | `1` | Phase 3: set to `0` to skip summarisation. |
 | `JUDGMENTS_SUMMARY_MAX_PER_RUN` | `15` | Phase 3: max docs summarised per `zeeker build`. |
 | `JUDGMENTS_SUMMARY_MAX_BATCHES` | `20` | Phase 3: max rolling-pass batches per doc (wider batch_size for large docs). |
-| `JUDGMENTS_SUMMARY_MAX_RETRIES` | `3` | Phase 3: failures before a doc is quarantined. |
-| `JUDGMENTS_SUMMARY_RETRY_AFTER` | `86400` | Phase 3: quarantine TTL in seconds (default 24h). |
+| `JUDGMENTS_SUMMARY_MAX_RETRIES` | `3` | Phase 3: primary-model failures before a doc escalates to the alt-model priority pool. |
+| `JUDGMENTS_SUMMARY_HARD_FAIL_LIMIT` | `6` | Phase 3: TOTAL failures (primary + alt) before a doc is hard-quarantined instead of retried every build. |
+| `JUDGMENTS_SUMMARY_RETRY_AFTER_HARD` | `604800` | Phase 3: hard-quarantine TTL in seconds (default 1 week) between attempts once a doc hits the hard-fail limit. |
 | `JUDGMENTS_SUMMARY_MAX_INPUT_CHARS` | `32000` | Phase 3: char budget for composed LLM input (~8K tokens). |
 | `LLM_BASE_URL` | *unset* | Phase 3: OpenAI-compatible endpoint. Unset → Phase 3 skips. |
 | `LLM_API_KEY` | `not-needed` | Phase 3: optional for local servers; required for cloud. |
