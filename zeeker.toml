@@ -15,10 +15,10 @@ sort_desc = "decision_date"
 label_column = "case_name"
 size = 25
 # Phase 2 is live: each build enriches up to JUDGMENTS_EXTRACT_MAX_PER_RUN
-# rows (default 15) whose content_text is NULL, parsing HTML from the
+# rows (default 50) whose content_text is NULL, parsing HTML from the
 # detail page and emitting per-paragraph rows into judgments_fragments.
-# The on-disk extraction cache under .cache/ is the source of truth that
-# survives zeeker's module reload between main-table and fragment phases.
+# The on-disk extraction cache under .cache/ survives crashes mid-run and
+# lets rule changes re-parse from archived HTML without server traffic.
 #
 # Main-table FTS covers catalog/summary fields only; full-judgment text
 # search runs on the fragments FTS index (fragments_fts_fields below),
