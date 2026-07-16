@@ -42,8 +42,8 @@ Phase-1 specifics
 
 Phase-2 specifics
 -----------------
-- Batch cap: ``EXTRACT_MAX_PER_RUN`` (~15 docs per run, conservative given
-  the source is flaky).
+- Batch cap: ``EXTRACT_MAX_PER_RUN`` (~50 docs per run by default; lower it
+  if the source is flaky).
 - Failure tracking: ``checkpoint_judgments_extraction.json`` records per-id
   failure count + last error + last attempt timestamp. After
   ``EXTRACT_MAX_RETRIES`` failures a doc is quarantined until
@@ -121,7 +121,7 @@ SUMMARY_CHECKPOINT_FILE = Path("checkpoint_judgments_summary.json")
 
 # Phase 2 knobs
 EXTRACT_ENABLED = os.environ.get("JUDGMENTS_EXTRACT_ENABLED", "1") == "1"
-EXTRACT_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_EXTRACT_MAX_PER_RUN", "15"))
+EXTRACT_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_EXTRACT_MAX_PER_RUN", "50"))
 EXTRACT_MAX_RETRIES = int(os.environ.get("JUDGMENTS_EXTRACT_MAX_RETRIES", "3"))
 EXTRACT_RETRY_AFTER = int(os.environ.get("JUDGMENTS_EXTRACT_RETRY_AFTER", "86400"))
 EXTRACT_DELAY_BASE = float(os.environ.get("JUDGMENTS_EXTRACT_DELAY_BASE", "1.5"))
@@ -129,7 +129,7 @@ EXTRACT_DELAY_JITTER = float(os.environ.get("JUDGMENTS_EXTRACT_DELAY_JITTER", "0
 
 # Phase 3 knobs
 SUMMARY_ENABLED = os.environ.get("JUDGMENTS_SUMMARY_ENABLED", "1") == "1"
-SUMMARY_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_PER_RUN", "15"))
+SUMMARY_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_PER_RUN", "50"))
 SUMMARY_MAX_RETRIES = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_RETRIES", "3"))
 # Escalation ceiling: once a doc has failed this many times TOTAL (primary
 # attempts + alt-model priority retries), it stops bypassing quarantine and
@@ -695,7 +695,7 @@ def _run_phase2(
         # Fresh DB with no Phase 1 rows yet — nothing to enrich.
         return
     if breaker.is_open:
-        click.echo("Phase 2: circuit breaker open from Phase 1 — skipping.")
+        click.echo("Phase 2: circuit breaker open from Phase 1 — skipping.", err=True)
         return
 
     # Sentinel: zeeker will re-invoke fetch_data after module reload to
@@ -738,27 +738,29 @@ def _run_phase2(
     transient_failures = 0
     skipped_quarantined = 0
     attempted = 0
+    aborted = False
 
     try:
         for row in candidates:
             if attempted >= EXTRACT_MAX_PER_RUN:
                 break
             if breaker.is_open:
-                click.echo("Phase 2: circuit breaker tripped — stopping early.")
+                click.echo("Phase 2: circuit breaker tripped — stopping early.", err=True)
+                aborted = True
                 break
             jid = row["id"]
             if _is_quarantined(state, jid, now):
                 skipped_quarantined += 1
                 continue
             attempted += 1
-            label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
+            label = f"[{row.get('court') or '?'}] {row.get('citation') or jid}"
             try:
                 status, detail = _enrich_row(client, row, existing_table, breaker)
             except Exception as exc:  # defensive — should be rare
                 transient_failures += 1
                 _record_extraction_failure(state, jid, exc)
                 click.echo(
-                    f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → UNEXPECTED: {exc}", err=True
+                    f"  {attempted}/{EXTRACT_MAX_PER_RUN} {label} → UNEXPECTED: {exc}", err=True
                 )
                 save_extraction_state(state)
                 continue
@@ -766,17 +768,17 @@ def _run_phase2(
             if status == "ok":
                 successes += 1
                 _clear_extraction_failure(state, jid)
-                click.echo(f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → {detail}")
+                click.echo(f"  {attempted}/{EXTRACT_MAX_PER_RUN} {label} → {detail}")
             elif status == "empty":
                 structurally_empty += 1
                 _clear_extraction_failure(state, jid)  # structural, not transient
-                click.echo(f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → empty ({detail})")
+                click.echo(f"  {attempted}/{EXTRACT_MAX_PER_RUN} {label} → empty ({detail})")
             else:  # http_error
                 transient_failures += 1
                 fake = RuntimeError(detail or "http error")
                 _record_extraction_failure(state, jid, fake)
                 click.echo(
-                    f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → fetch failed: {detail}",
+                    f"  {attempted}/{EXTRACT_MAX_PER_RUN} {label} → fetch failed: {detail}",
                     err=True,
                 )
             save_extraction_state(state)
@@ -785,12 +787,16 @@ def _run_phase2(
         save_extraction_state(state)
         raise
 
-    click.echo(
-        f"Phase 2 complete: {successes} extracted, {structurally_empty} empty-body, "
+    counts = (
+        f"{successes} extracted, {structurally_empty} empty-body, "
         f"{transient_failures} fetch-failed, {skipped_quarantined} quarantined; "
         f"{remaining_total - successes - structurally_empty} NULL-content rows "
         f"remain in DB."
     )
+    if aborted:
+        click.echo(f"Phase 2 ABORTED (circuit breaker): {counts}", err=True)
+    else:
+        click.echo(f"Phase 2 complete: {counts}")
 
 
 # =============================================================================
@@ -1029,7 +1035,7 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
             endpoint = os.environ.get(
                 "LLM_BASE_URL_2" if (is_priority and client_alt is not None) else "LLM_BASE_URL", ""
             )
-            label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
+            label = f"[{row.get('court') or '?'}] {row.get('citation') or jid}"
             priority_tag = " [alt-model]" if is_priority else ""
             try:
                 status, detail = _summarise_row(
@@ -1039,7 +1045,7 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                 failures += 1
                 _record_summary_failure(state, jid, exc)
                 click.echo(
-                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → UNEXPECTED: {exc}",
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} {label}{priority_tag} → UNEXPECTED: {exc}",
                     err=True,
                 )
                 _phase3_log(
@@ -1062,17 +1068,17 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
             if status == "ok":
                 successes += 1
                 _clear_summary_failure(state, jid)
-                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → {detail}")
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} {label}{priority_tag} → {detail}")
             elif status == "cached":
                 cached_hits += 1
                 _clear_summary_failure(state, jid)
-                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → cached")
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} {label}{priority_tag} → cached")
             else:  # error
                 failures += 1
                 fake = RuntimeError(detail or "llm error")
                 _record_summary_failure(state, jid, fake)
                 click.echo(
-                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → llm failed: {detail}",
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} {label}{priority_tag} → llm failed: {detail}",
                     err=True,
                 )
             _phase3_log(
@@ -1093,9 +1099,31 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
     except KeyboardInterrupt:
         click.echo("Phase 3 interrupted — state saved", err=True)
         save_summary_state(state)
+        _phase3_log(
+            {
+                "event": "interrupted",
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "successes": successes,
+                "cached": cached_hits,
+                "failures": failures,
+                "skipped_quarantined": skipped_quarantined,
+                "remaining": remaining_total - successes - cached_hits,
+            }
+        )
         raise
 
     save_summary_state(state)
+    _phase3_log(
+        {
+            "event": "complete",
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "successes": successes,
+            "cached": cached_hits,
+            "failures": failures,
+            "skipped_quarantined": skipped_quarantined,
+            "remaining": remaining_total - successes - cached_hits,
+        }
+    )
     click.echo(
         f"Phase 3 complete: {successes} summarised, {cached_hits} from cache, "
         f"{failures} failed, {skipped_quarantined} quarantined; "
@@ -1140,6 +1168,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     page = start_page
     url = urljoin(BASE_URL, INDEX_PATH)
     exhausted = False
+    abort_reason: Optional[str] = None
 
     def _snapshot(last_completed_page: int) -> dict:
         return {
@@ -1174,7 +1203,8 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                     breaker.record_failure()
                     click.echo(f"  → Fetch failed after retries: {exc}", err=True)
                     save_checkpoint(_snapshot(page - 1))
-                    click.echo("Aborting run — checkpoint saved. Try again later.")
+                    click.echo("Aborting run — checkpoint saved. Try again later.", err=True)
+                    abort_reason = "fetch failure"
                     break
 
                 if response.status_code == 404:
@@ -1188,6 +1218,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                         err=True,
                     )
                     save_checkpoint(_snapshot(page - 1))
+                    abort_reason = f"HTTP {response.status_code}"
                     break
 
                 breaker.record_success()
@@ -1255,7 +1286,14 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         if exhausted:
             clear_checkpoint()
 
-        click.echo(f"Discovery run complete: {len(staged)} new records, {breaker.summary()}")
+        if abort_reason is not None:
+            click.echo(
+                f"Discovery ABORTED ({abort_reason}): {len(staged)} new records, "
+                f"{breaker.summary()}",
+                err=True,
+            )
+        else:
+            click.echo(f"Discovery OK: {len(staged)} new records, {breaker.summary()}")
 
         # Phase 2 runs inside the same client context so it reuses the
         # connection pool. Uses the breaker state from Phase 1 — if the

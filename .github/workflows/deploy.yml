@@ -46,6 +46,13 @@ jobs:
       run: |
         uv run zeeker build
 
+    - name: Verify database exists
+      run: |
+        if [ ! -f "zeeker-judgements.db" ]; then
+          echo "ERROR: zeeker-judgements.db was not produced by the build — aborting before backup/deploy."
+          exit 1
+        fi
+
     - name: Backup existing database
       env:
         S3_BUCKET: ${{ secrets.S3_BUCKET }}
