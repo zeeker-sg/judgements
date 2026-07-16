@@ -110,7 +110,7 @@ When implementing resources that need external libraries:
   `content_text` + `court_summary` on the main row and emits per-paragraph
   rows into `judgments_fragments`. Runs in the **same** `fetch_data()`
   invocation as Phase 1 (after discovery, before return), so there is one
-  resource, one build command, two phases per run. Default cap is 15 docs
+  resource, one build command, two phases per run. Default cap is 50 docs
   per build — with a 10,588-doc backlog, expect hundreds of runs to drain.
   Fragments are inserted inline from `fetch_data` (not via
   `fetch_fragments_data`, which is a no-op stub); see the "Implementation
@@ -120,7 +120,7 @@ When implementing resources that need external libraries:
   **same** `fetch_data()` invocation after Phase 2, so one
   `zeeker build judgments` drains all three backlogs on a single pass.
   Skips gracefully when `LLM_BASE_URL` is unset (local-first — no cloud
-  dependency required). Default cap is 15 docs per build; see "Phase 3
+  dependency required). Default cap is 50 docs per build; see "Phase 3
   implementation notes" below.
 - **Deployment (deferred):** No S3 workflow wired up yet. The
   auto-generated `.github/workflows/deploy.yml` is inert until secrets are
@@ -362,13 +362,13 @@ vars (handy for smoke tests — no code edits required):
 | `JUDGMENTS_DELAY_BASE` | `1.5` | Phase 1: base sleep (s) between listing-page fetches. |
 | `JUDGMENTS_DELAY_JITTER` | `0.5` | Phase 1: +/- jitter added to the base sleep. |
 | `JUDGMENTS_EXTRACT_ENABLED` | `1` | Phase 2: set to `0` to run discovery only (skip enrichment). |
-| `JUDGMENTS_EXTRACT_MAX_PER_RUN` | `15` | Phase 2: max docs enriched per `zeeker build`. |
+| `JUDGMENTS_EXTRACT_MAX_PER_RUN` | `50` | Phase 2: max docs enriched per `zeeker build`. |
 | `JUDGMENTS_EXTRACT_MAX_RETRIES` | `3` | Phase 2: failures before a doc is quarantined. |
 | `JUDGMENTS_EXTRACT_RETRY_AFTER` | `86400` | Phase 2: quarantine TTL in seconds (default 24h). |
 | `JUDGMENTS_EXTRACT_DELAY_BASE` | `1.5` | Phase 2: base sleep (s) between detail-page fetches. |
 | `JUDGMENTS_EXTRACT_DELAY_JITTER` | `0.5` | Phase 2: +/- jitter on the sleep. |
 | `JUDGMENTS_SUMMARY_ENABLED` | `1` | Phase 3: set to `0` to skip summarisation. |
-| `JUDGMENTS_SUMMARY_MAX_PER_RUN` | `15` | Phase 3: max docs summarised per `zeeker build`. |
+| `JUDGMENTS_SUMMARY_MAX_PER_RUN` | `50` | Phase 3: max docs summarised per `zeeker build`. |
 | `JUDGMENTS_SUMMARY_MAX_BATCHES` | `20` | Phase 3: max rolling-pass batches per doc (wider batch_size for large docs). |
 | `JUDGMENTS_SUMMARY_MAX_RETRIES` | `3` | Phase 3: primary-model failures before a doc escalates to the alt-model priority pool. |
 | `JUDGMENTS_SUMMARY_HARD_FAIL_LIMIT` | `6` | Phase 3: TOTAL failures (primary + alt) before a doc is hard-quarantined instead of retried every build. |
@@ -404,8 +404,8 @@ vars (handy for smoke tests — no code edits required):
 - **Batch-crawl pacing (Phase 1):** at defaults, ~50 pages ≈ 75s sleep +
   fetch/parse. Each run lands ~500 new records; ~22 runs cover the full
   archive.
-- **Enrichment pacing (Phase 2):** at defaults, ~15 docs ≈ 25s per run.
-  With a 10,588-doc backlog expect ~700 runs to drain. Set
+- **Enrichment pacing (Phase 2):** at defaults, ~50 docs ≈ 85s per run.
+  With a 10,588-doc backlog expect ~200 runs to drain. Set
   `JUDGMENTS_EXTRACT_MAX_PER_RUN` higher if the source is cooperating,
   lower (or `0` via `JUDGMENTS_EXTRACT_ENABLED=0`) if it's flaky.
 - **Politeness:** single `httpx.Client` connection pool shared across
@@ -474,7 +474,7 @@ The `judgments` resource is a **3-phase pipeline** that does real work even when
 
 | Phase | What it does | Log signal | Shows in SUMMARY? |
 |-------|-------------|------------|-------------------|
-| Phase 1 (discovery) | Scrape eLitigation listing pages for new judgment metadata | `Discovery run complete: N new records` | Yes — counted as "succeeded" if N > 0 |
+| Phase 1 (discovery) | Scrape eLitigation listing pages for new judgment metadata | `Discovery OK: N new records` (or `Discovery ABORTED (<reason>): ...` on stderr when the run stopped on a fetch/HTTP failure) | Yes — counted as "succeeded" if N > 0 |
 | Phase 2 (enrichment) | Fetch full HTML for existing rows with NULL content_text, extract paragraphs | `Phase 2 complete: N extracted, ... M NULL-content rows remain` | **No** — runs inside the same fetch_data() call but doesn't count as "succeeded" |
 | Phase 3 (summarisation) | LLM-generate summaries for rows with NULL summary | `Phase 3 complete: N summarised, ... m NULL-summary rows remain` | **No** — same reason |
 
