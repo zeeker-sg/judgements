@@ -131,7 +131,12 @@ EXTRACT_DELAY_JITTER = float(os.environ.get("JUDGMENTS_EXTRACT_DELAY_JITTER", "0
 SUMMARY_ENABLED = os.environ.get("JUDGMENTS_SUMMARY_ENABLED", "1") == "1"
 SUMMARY_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_PER_RUN", "15"))
 SUMMARY_MAX_RETRIES = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_RETRIES", "3"))
-SUMMARY_RETRY_AFTER = int(os.environ.get("JUDGMENTS_SUMMARY_RETRY_AFTER", "86400"))
+# Escalation ceiling: once a doc has failed this many times TOTAL (primary
+# attempts + alt-model priority retries), it stops bypassing quarantine and
+# only gets one attempt per SUMMARY_RETRY_AFTER_HARD window (default 1 week)
+# instead of burning a Phase 3 slot every build.
+SUMMARY_HARD_FAIL_LIMIT = int(os.environ.get("JUDGMENTS_SUMMARY_HARD_FAIL_LIMIT", "6"))
+SUMMARY_RETRY_AFTER_HARD = int(os.environ.get("JUDGMENTS_SUMMARY_RETRY_AFTER_HARD", "604800"))
 SUMMARY_MAX_INPUT_CHARS = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_INPUT_CHARS", "32000"))
 
 # Per-process sentinel so Phase 2 runs ONCE per build even though zeeker
@@ -150,6 +155,7 @@ def _phase3_log(entry: dict) -> None:
             fh.flush()
     except OSError:
         pass
+
 
 # Per-process cache — zeeker's fragment build flow may call fetch_data twice
 # (once for main-table insert, once to provide main_data_context for fragments).
@@ -827,17 +833,29 @@ def _clear_summary_failure(state: dict, jid: str) -> None:
 
 
 def _is_summary_quarantined(state: dict, jid: str, now: datetime) -> bool:
+    """Escalating quarantine — three tiers by total failure count:
+
+    - ``count < SUMMARY_MAX_RETRIES``: never quarantined; retried with the
+      primary model each build.
+    - ``SUMMARY_MAX_RETRIES <= count < SUMMARY_HARD_FAIL_LIMIT``: never
+      quarantined; these are the priority pool that deliberately bypasses
+      any TTL so the alt endpoint gets its retries.
+    - ``count >= SUMMARY_HARD_FAIL_LIMIT``: both endpoints have had their
+      chances — hard-quarantined for SUMMARY_RETRY_AFTER_HARD (default
+      1 week) after the last attempt, so a persistently failing doc stops
+      burning a Phase 3 slot every build (issue #3).
+    """
     entry = state.get("failures", {}).get(jid)
     if entry is None:
         return False
-    if int(entry.get("count", 0)) < SUMMARY_MAX_RETRIES:
+    if int(entry.get("count", 0)) < SUMMARY_HARD_FAIL_LIMIT:
         return False
     last_attempt_str = entry.get("last_attempt") or ""
     try:
         last_attempt = datetime.fromisoformat(last_attempt_str)
     except ValueError:
         return False
-    return (now - last_attempt).total_seconds() < SUMMARY_RETRY_AFTER
+    return (now - last_attempt).total_seconds() < SUMMARY_RETRY_AFTER_HARD
 
 
 def _ensure_phase3_columns(table: Table) -> None:
@@ -954,11 +972,14 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
         click.echo("Phase 3: no rows need summarisation.")
         return
 
-    # Priority queue: quarantined docs (fail_count >= SUMMARY_MAX_RETRIES) fill first,
-    # then date-ordered fresh docs. Quarantined docs bypass the TTL check — they're
-    # here specifically to be retried on the (potentially updated) endpoint.
+    # Priority queue: escalated docs (fail_count >= SUMMARY_MAX_RETRIES) fill first,
+    # then date-ordered fresh docs. Escalated docs are retried on the alt endpoint
+    # and bypass any TTL — until they hit SUMMARY_HARD_FAIL_LIMIT total failures,
+    # after which the loop's hard-quarantine check skips them for
+    # SUMMARY_RETRY_AFTER_HARD between attempts.
     quarantined_ids = {
-        jid for jid, info in state.get("failures", {}).items()
+        jid
+        for jid, info in state.get("failures", {}).items()
         if info.get("count", 0) >= SUMMARY_MAX_RETRIES
     }
     priority_docs = [r for r in all_candidates if r["id"] in quarantined_ids]
@@ -971,9 +992,16 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
         f"remaining (model={model}{alt_label}, max_chars={SUMMARY_MAX_INPUT_CHARS}, "
         f"priority={len(priority_docs)})"
     )
-    _phase3_log({"event": "start", "ts": datetime.now().isoformat(timespec="seconds"),
-                 "remaining": remaining_total, "model": model, "model_alt": model_alt,
-                 "priority_quarantined": len(priority_docs)})
+    _phase3_log(
+        {
+            "event": "start",
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "remaining": remaining_total,
+            "model": model,
+            "model_alt": model_alt,
+            "priority_quarantined": len(priority_docs),
+        }
+    )
 
     successes = 0
     cached_hits = 0
@@ -986,22 +1014,27 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
             if attempted >= SUMMARY_MAX_PER_RUN:
                 break
             jid = row["id"]
-            fail_count = state.get("failures", {}).get(jid, {}).get("count", 0)
-            # Quarantined docs (fail_count >= SUMMARY_MAX_RETRIES) bypass TTL —
-            # they were promoted to priority slots to be retried. Fresh docs still
-            # respect TTL to avoid hammering on transient failures.
-            if fail_count < SUMMARY_MAX_RETRIES and _is_summary_quarantined(state, jid, now):
+            # Docs at or past SUMMARY_HARD_FAIL_LIMIT are hard-quarantined for
+            # SUMMARY_RETRY_AFTER_HARD; below that, priority docs bypass any
+            # TTL so the alt endpoint gets its retries (see
+            # _is_summary_quarantined for the full tier breakdown). Skips
+            # happen before ``attempted`` increments, so they cost nothing.
+            if _is_summary_quarantined(state, jid, now):
                 skipped_quarantined += 1
                 continue
             attempted += 1
             is_priority = jid in quarantined_ids
             use_model = model_alt if is_priority else model
             use_client = client_alt if (is_priority and client_alt is not None) else client
-            endpoint = os.environ.get("LLM_BASE_URL_2" if (is_priority and client_alt is not None) else "LLM_BASE_URL", "")
+            endpoint = os.environ.get(
+                "LLM_BASE_URL_2" if (is_priority and client_alt is not None) else "LLM_BASE_URL", ""
+            )
             label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
             priority_tag = " [alt-model]" if is_priority else ""
             try:
-                status, detail = _summarise_row(row, existing_table, use_client, use_model, endpoint=endpoint)
+                status, detail = _summarise_row(
+                    row, existing_table, use_client, use_model, endpoint=endpoint
+                )
             except Exception as exc:  # defensive
                 failures += 1
                 _record_summary_failure(state, jid, exc)
@@ -1009,13 +1042,20 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                     f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → UNEXPECTED: {exc}",
                     err=True,
                 )
-                _phase3_log({
-                    "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
-                    "n": attempted, "id": jid,
-                    "citation": row.get("citation"), "court": row.get("court"),
-                    "status": "error", "detail": f"UNEXPECTED: {exc}",
-                    "model": use_model, "alt": is_priority,
-                })
+                _phase3_log(
+                    {
+                        "event": "attempt",
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "n": attempted,
+                        "id": jid,
+                        "citation": row.get("citation"),
+                        "court": row.get("court"),
+                        "status": "error",
+                        "detail": f"UNEXPECTED: {exc}",
+                        "model": use_model,
+                        "alt": is_priority,
+                    }
+                )
                 save_summary_state(state)
                 continue
 
@@ -1035,13 +1075,20 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
                     f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → llm failed: {detail}",
                     err=True,
                 )
-            _phase3_log({
-                "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
-                "n": attempted, "id": jid,
-                "citation": row.get("citation"), "court": row.get("court"),
-                "status": status, "detail": detail,
-                "model": use_model, "alt": is_priority,
-            })
+            _phase3_log(
+                {
+                    "event": "attempt",
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "n": attempted,
+                    "id": jid,
+                    "citation": row.get("citation"),
+                    "court": row.get("court"),
+                    "status": status,
+                    "detail": detail,
+                    "model": use_model,
+                    "alt": is_priority,
+                }
+            )
             save_summary_state(state)
     except KeyboardInterrupt:
         click.echo("Phase 3 interrupted — state saved", err=True)
