@@ -9,7 +9,8 @@ Scope:    ~10,588 judgments across SGCA, SGHC, SGHCA, SGHCF, SGHCR, SGDC,
 Cadence:  Tier 4 one-shot batch for initial backfill; transitions to Tier 1
           daily incremental once the archive is fully discovered.
 
-Two-phase pipeline runs in one fetch_data invocation per build:
+Three-phase pipeline runs in one fetch_data invocation per build
+(fetch_data runs exactly once — zeeker >= 0.9.0 single-fetch lifecycle):
 
 Phase 1 (discovery): scrape listing pages, persist catalog metadata
   (citation, case name, court, date, subject tags, source_url, pdf_url).
@@ -20,10 +21,8 @@ Phase 2 (enrichment): for each existing row with ``content_text IS NULL``,
   via resources.extraction, archive raw HTML under ``.cache/judgments_html/``
   and parsed output under ``.cache/judgments_extractions/``, then
   ``existing_table.update()`` the row with content_text, court_summary,
-  has_content, has_court_summary, fragment_count, extracted_at. The extraction
-  cache is the source of truth that ``fetch_fragments_data`` reads from —
-  zeeker reloads this module between main-table and fragment phases, so any
-  in-memory state would be lost. Disk cache survives the reload and any
+  has_content, has_court_summary, fragment_count, extracted_at. Fragment
+  rows are inserted in the same transaction; the disk caches survive any
   crash mid-run (atomic writes).
 
 Crawl strategy (shared)
@@ -60,7 +59,6 @@ import json
 import os
 import random
 import re
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -68,8 +66,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urljoin
 
 import click
+
+# Sibling modules in resources/ import directly: zeeker >= 0.9.0 puts this
+# directory on sys.path while the module loads (top-level imports only).
+import extraction
+import extraction_cache
 import httpx
+import summarization
+import summary_cache
 from bs4 import BeautifulSoup
+from extraction import ExtractionError
 from sqlite_utils.db import Table
 from tenacity import (
     retry,
@@ -77,17 +83,7 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
-
-# Zeeker loads resource files via importlib.util.spec_from_file_location,
-# which bypasses package imports — ``from resources import ...`` fails at
-# build time. Make sibling modules importable by adding this file's
-# directory to sys.path before importing them.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import extraction  # noqa: E402
-import extraction_cache  # noqa: E402
-import summarization  # noqa: E402
-import summary_cache  # noqa: E402
-from extraction import ExtractionError  # noqa: E402
+from zeeker import Skip
 
 # =============================================================================
 # CONFIGURATION
@@ -139,11 +135,6 @@ SUMMARY_HARD_FAIL_LIMIT = int(os.environ.get("JUDGMENTS_SUMMARY_HARD_FAIL_LIMIT"
 SUMMARY_RETRY_AFTER_HARD = int(os.environ.get("JUDGMENTS_SUMMARY_RETRY_AFTER_HARD", "604800"))
 SUMMARY_MAX_INPUT_CHARS = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_INPUT_CHARS", "32000"))
 
-# Per-process sentinel so Phase 2 runs ONCE per build even though zeeker
-# reloads this module and re-calls fetch_data to populate fragment context.
-# Module-level vars don't survive the reload; env vars do (same process).
-_PHASE2_SENTINEL_ENV = "_JUDGMENTS_PHASE2_RAN_PID"
-_PHASE3_SENTINEL_ENV = "_JUDGMENTS_PHASE3_RAN_PID"
 _PHASE3_PROGRESS_FILE = Path(__file__).parent.parent / "phase3_progress.jsonl"
 
 
@@ -156,12 +147,6 @@ def _phase3_log(entry: dict) -> None:
     except OSError:
         pass
 
-
-# Per-process cache — zeeker's fragment build flow may call fetch_data twice
-# (once for main-table insert, once to provide main_data_context for fragments).
-# Caching here keeps the crawl idempotent within a single process so we don't
-# double the HTTP cost or advance the checkpoint past work zeeker will ignore.
-_FETCH_CACHE: Optional[List[Dict[str, Any]]] = None
 
 # Parsing — court alternation is permissive because eLitigation emits codes
 # beyond the "canonical six" (SGHCA appellate division, SGHCR registrar
@@ -525,6 +510,16 @@ def _ensure_fragments_table(db) -> Table:
     return db[FRAGMENTS_TABLE_NAME]
 
 
+def _count_where(table: Optional[Table], where: str) -> int:
+    """Row count for a WHERE clause; 0 when the table/columns don't exist yet."""
+    if table is None:
+        return 0
+    try:
+        return table.count_where(where)
+    except Exception:
+        return 0
+
+
 def _update_row(table: Table, jid: str, updates: Dict[str, Any]) -> None:
     """``UPDATE judgments SET <cols> WHERE id = ?`` — works regardless of PK."""
     if not updates:
@@ -683,28 +678,33 @@ def _enrich_row(
     )
 
 
+def _phase2_stats(**overrides: int) -> Dict[str, int]:
+    stats = {"extracted": 0, "empty": 0, "failed": 0, "quarantined": 0, "backlog": 0}
+    stats.update(overrides)
+    return stats
+
+
 def _run_phase2(
     client: httpx.Client,
     existing_table: Optional[Table],
     breaker: CircuitBreaker,
-) -> None:
+) -> Dict[str, int]:
+    """Drain part of the enrichment backlog. Returns this run's counters.
+
+    Keys: ``extracted`` (rows populated), ``empty`` (structurally empty
+    pages marked done), ``failed``, ``quarantined`` (skipped), and
+    ``backlog`` (NULL-content rows still remaining in the DB).
+    """
+    backlog = _count_where(existing_table, "content_text IS NULL")
     if not EXTRACT_ENABLED:
         click.echo("Phase 2: disabled (JUDGMENTS_EXTRACT_ENABLED=0) — skipping.")
-        return
+        return _phase2_stats(backlog=backlog)
     if existing_table is None:
         # Fresh DB with no Phase 1 rows yet — nothing to enrich.
-        return
+        return _phase2_stats()
     if breaker.is_open:
         click.echo("Phase 2: circuit breaker open from Phase 1 — skipping.", err=True)
-        return
-
-    # Sentinel: zeeker will re-invoke fetch_data after module reload to
-    # build fragment context. Skip Phase 2 on the second call so we don't
-    # double the enrichment budget within one build.
-    if os.environ.get(_PHASE2_SENTINEL_ENV) == str(os.getpid()):
-        click.echo("Phase 2: already ran this build (fragment-context pass) — skipping.")
-        return
-    os.environ[_PHASE2_SENTINEL_ENV] = str(os.getpid())
+        return _phase2_stats(backlog=backlog)
 
     _ensure_phase2_columns(existing_table)
 
@@ -725,7 +725,7 @@ def _run_phase2(
     remaining_total = len(candidates)
     if remaining_total == 0:
         click.echo("Phase 2: no rows need enrichment.")
-        return
+        return _phase2_stats()
 
     click.echo(
         f"Phase 2: enriching up to {EXTRACT_MAX_PER_RUN} / {remaining_total} "
@@ -787,16 +787,24 @@ def _run_phase2(
         save_extraction_state(state)
         raise
 
+    remaining = remaining_total - successes - structurally_empty
     counts = (
         f"{successes} extracted, {structurally_empty} empty-body, "
         f"{transient_failures} fetch-failed, {skipped_quarantined} quarantined; "
-        f"{remaining_total - successes - structurally_empty} NULL-content rows "
+        f"{remaining} NULL-content rows "
         f"remain in DB."
     )
     if aborted:
         click.echo(f"Phase 2 ABORTED (circuit breaker): {counts}", err=True)
     else:
         click.echo(f"Phase 2 complete: {counts}")
+    return _phase2_stats(
+        extracted=successes,
+        empty=structurally_empty,
+        failed=transient_failures,
+        quarantined=skipped_quarantined,
+        backlog=remaining,
+    )
 
 
 # =============================================================================
@@ -943,21 +951,30 @@ def _summarise_row(
     return "ok", f"{len(summary_text)} chars"
 
 
-def _run_phase3(existing_table: Optional[Table]) -> None:
+def _phase3_stats(**overrides: int) -> Dict[str, int]:
+    stats = {"summarised": 0, "cached": 0, "failed": 0, "quarantined": 0, "backlog": 0}
+    stats.update(overrides)
+    return stats
+
+
+def _run_phase3(existing_table: Optional[Table]) -> Dict[str, int]:
+    """Drain part of the summarisation backlog. Returns this run's counters.
+
+    Keys: ``summarised`` (fresh LLM summaries), ``cached`` (recovered from
+    disk cache), ``failed``, ``quarantined`` (skipped), and ``backlog``
+    (enriched rows still lacking a summary).
+    """
+    backlog = _count_where(existing_table, "has_content = 1 AND summary IS NULL")
     if not SUMMARY_ENABLED:
         click.echo("Phase 3: disabled (JUDGMENTS_SUMMARY_ENABLED=0) — skipping.")
-        return
+        return _phase3_stats(backlog=backlog)
     if existing_table is None:
-        return
-    if os.environ.get(_PHASE3_SENTINEL_ENV) == str(os.getpid()):
-        click.echo("Phase 3: already ran this build (fragment-context pass) — skipping.")
-        return
-    os.environ[_PHASE3_SENTINEL_ENV] = str(os.getpid())
+        return _phase3_stats()
 
     client = summarization.make_client()
     if client is None:
         click.echo("Phase 3: LLM not configured (LLM_BASE_URL unset) — skipping.")
-        return
+        return _phase3_stats(backlog=backlog)
 
     client_alt = summarization.make_client_alt()
     _ensure_phase3_columns(existing_table)
@@ -976,7 +993,7 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
     remaining_total = len(all_candidates)
     if remaining_total == 0:
         click.echo("Phase 3: no rows need summarisation.")
-        return
+        return _phase3_stats()
 
     # Priority queue: escalated docs (fail_count >= SUMMARY_MAX_RETRIES) fill first,
     # then date-ordered fresh docs. Escalated docs are retried on the alt endpoint
@@ -1124,10 +1141,18 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
             "remaining": remaining_total - successes - cached_hits,
         }
     )
+    remaining = remaining_total - successes - cached_hits
     click.echo(
         f"Phase 3 complete: {successes} summarised, {cached_hits} from cache, "
         f"{failures} failed, {skipped_quarantined} quarantined; "
-        f"{remaining_total - successes - cached_hits} NULL-summary rows remain."
+        f"{remaining} NULL-summary rows remain."
+    )
+    return _phase3_stats(
+        summarised=successes,
+        cached=cached_hits,
+        failed=failures,
+        quarantined=skipped_quarantined,
+        backlog=remaining,
     )
 
 
@@ -1140,15 +1165,14 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     Respects ``MAX_PAGES_PER_RUN`` (batch limit) and
     ``INCREMENTAL_STOP_THRESHOLD`` (steady-state early exit).
     State persisted to ``checkpoint_judgments_discovery.json``.
-    """
-    global _FETCH_CACHE
-    if _FETCH_CACHE is not None:
-        click.echo(
-            f"fetch_data: returning {len(_FETCH_CACHE)} cached records "
-            f"(already fetched this process)"
-        )
-        return _FETCH_CACHE
 
+    Runs exactly once per build (zeeker >= 0.9.0 single-fetch lifecycle),
+    with Phases 2 and 3 draining their backlogs before this returns. Their
+    counters are surfaced via the module-level ``__zeeker_report__``. When
+    discovery aborts (fetch failure / HTTP error) and NO work happened in
+    any phase, raises ``Skip(kind="blocked")`` so the build shows the
+    outage instead of a healthy-looking "no data returned".
+    """
     existing_ids: set[str] = set()
     if existing_table is not None:
         existing_ids = {row["id"] for row in existing_table.rows}
@@ -1298,14 +1322,40 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         # Phase 2 runs inside the same client context so it reuses the
         # connection pool. Uses the breaker state from Phase 1 — if the
         # source was flaky during discovery we skip enrichment entirely.
-        _run_phase2(client, existing_table, breaker)
+        p2 = _run_phase2(client, existing_table, breaker)
 
     # Phase 3 lives outside the httpx client block — the LLM call goes
     # through its own OpenAI-compatible client, not the eLitigation
     # connection pool.
-    _run_phase3(existing_table)
+    p3 = _run_phase3(existing_table)
 
-    _FETCH_CACHE = staged
+    # Surface enrichment work on the build status line and in --json —
+    # zeeker reads (and clears) this module-level dict on every exit path,
+    # including the Skip raised below.
+    summarised = p3["summarised"] + p3["cached"]
+    notes_parts = []
+    if abort_reason is not None:
+        notes_parts.append(f"discovery aborted ({abort_reason})")
+    notes_parts.append(f"phase2 +{p2['extracted']} extracted ({p2['backlog']} backlog)")
+    notes_parts.append(f"phase3 +{summarised} summarised ({p3['backlog']} backlog)")
+    global __zeeker_report__
+    __zeeker_report__ = {
+        "extracted": p2["extracted"],
+        "summarised": summarised,
+        "extract_backlog": p2["backlog"],
+        "summary_backlog": p3["backlog"],
+        "notes": "; ".join(notes_parts),
+    }
+
+    # All-idle abort: discovery could not check the source AND no rows were
+    # staged AND enrichment/summarisation did no work either. Raise a
+    # "blocked" Skip so the freshness marker does not advance. Any partial
+    # progress (staged rows, enriched or summarised docs) is persisted by
+    # returning normally instead.
+    enrichment_worked = (p2["extracted"] + p2["empty"] + summarised) > 0
+    if abort_reason is not None and not staged and not enrichment_worked:
+        raise Skip(f"discovery aborted: {abort_reason}", kind="blocked")
+
     return staged
 
 

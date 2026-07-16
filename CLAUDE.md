@@ -254,16 +254,7 @@ sketch once we hit real code. Future-you should know about these:
    never fires. `_ensure_fragments_table` creates the table with
    `pk="id"` up front (see `FRAGMENT_COLUMNS` in `resources/judgments.py`).
 
-4. **Env-var sentinel guards against zeeker's module reload.** When
-   `fragments = true`, zeeker re-imports the resource module and calls
-   `fetch_data` a second time to build `main_data_context`. Module-level
-   variables don't survive the reload, so `_JUDGMENTS_PHASE2_RAN_PID`
-   lives in `os.environ` (process-scoped, survives the reload, naturally
-   cleared across builds). Second call sees the matching PID and skips
-   Phase 2 entirely. Without this, every build would enrich
-   `2 × EXTRACT_MAX_PER_RUN` docs instead of the budgeted number.
-
-5. **Two-layer disk cache under `.cache/`** (gitignored):
+4. **Two-layer disk cache under `.cache/`** (gitignored):
    - `.cache/judgments_html/{id}.html.gz` — raw detail-page HTML, gzipped.
      Source of truth for re-extraction. If parsing rules change, delete
      `.cache/judgments_extractions/` and re-run — no server traffic.
@@ -274,17 +265,18 @@ sketch once we hit real code. Future-you should know about these:
      re-parsing. Atomic writes (`tmp` + `os.replace`) prevent half-
      written files on crash.
 
-6. **Failure quarantine.** `checkpoint_judgments_extraction.json` tracks
+5. **Failure quarantine.** `checkpoint_judgments_extraction.json` tracks
    per-judgment failure count, last error, and last-attempt timestamp.
    After `EXTRACT_MAX_RETRIES` failures a doc is quarantined for
    `EXTRACT_RETRY_AFTER` seconds before the next attempt. This prevents
    a single broken page from burning the whole daily budget.
 
-7. **Sibling-module import hack in `resources/judgments.py`.** Zeeker
-   loads resource files via `importlib.util.spec_from_file_location`,
-   which bypasses package imports — `from resources import extraction`
-   fails at build time. We prepend `Path(__file__).parent` to `sys.path`
-   before importing sibling modules.
+6. **Sibling-module imports are plain top-level imports.** zeeker >= 0.9.0
+   puts `resources/` on `sys.path` while a resource module loads, so
+   `import extraction` etc. work directly — but ONLY at module top level
+   (the path entry is removed after load, so lazy in-function sibling
+   imports would fail). `tests/conftest.py` adds the same path for the
+   test suite.
 
 **Env vars (Phase 2):** set `JUDGMENTS_EXTRACT_ENABLED=0` to skip Phase 2
 entirely (useful during the initial Phase-1 archive crawl). The rest are
@@ -293,8 +285,7 @@ in the knob table below.
 ### Phase 3 implementation notes
 
 Phase 3 mirrors Phase 2's shape: batch-limited backfill, checkpointed
-failure tracking, disk cache for crash recovery, env-var sentinel to
-survive zeeker's module reload. The deltas worth knowing:
+failure tracking, disk cache for crash recovery. The deltas worth knowing:
 
 1. **The skill's naive `text[:4000]` truncation throws away the
    holding.** The zeeker-source-creator skill's suggested summariser
@@ -325,11 +316,7 @@ survive zeeker's module reload. The deltas worth knowing:
    `parse_listing_page`). Writes go through `_update_row` because zeeker
    didn't declare a primary key on `judgments`.
 
-4. **Env-var sentinel (`_JUDGMENTS_PHASE3_RAN_PID`) guards the module
-   reload.** Identical mechanism to Phase 2 — without it every build
-   would summarise `2 × SUMMARY_MAX_PER_RUN` docs.
-
-5. **Cache under `.cache/judgments_summaries/{id}.json`.** Survives
+4. **Cache under `.cache/judgments_summaries/{id}.json`.** Survives
    crashes after the LLM call but before the DB `UPDATE`. If parsing/
    prompting rules change, delete the JSONs and reset the rows' `summary`
    column to NULL to force regeneration. Atomic writes via tmp +
@@ -416,10 +403,16 @@ vars (handy for smoke tests — no code edits required):
 - **Build:** `uv run zeeker build judgments`. Re-invoke the same command
   to continue a batch crawl (checkpoint drives resume) and/or drain
   more of the enrichment backlog.
-- **zeeker quirk (dodged in Phase 2):** when `fragments = true` in
-  `zeeker.toml`, zeeker reloads the module and calls `fetch_data` a
-  second time to build fragment context. Our env-var sentinel
-  (`_JUDGMENTS_PHASE2_RAN_PID`) makes the second call skip Phase 2.
+- **Single-fetch lifecycle (zeeker >= 0.9.0):** `fetch_data` runs exactly
+  once per build — no module reload, no second fetch for fragment
+  context — so Phases 2/3 run exactly once with no sentinel guards.
+- **Status reporting (zeeker >= 0.9.0):** `fetch_data` sets
+  `__zeeker_report__` with `extracted` / `summarised` /
+  `extract_backlog` / `summary_backlog` counters (rendered on the
+  `[OK]`/`[SKIP]` line and in `--json`), and raises
+  `Skip("discovery aborted: …", kind="blocked")` when discovery aborted
+  AND zero work happened in any phase — see RUNBOOK.md for the full
+  status contract.
 
 ### Smoke test playbook
 **Phase 1 (discovery only):**
@@ -449,7 +442,7 @@ vars (handy for smoke tests — no code edits required):
    content_text=NULL WHERE id IN (…)`, re-run — expect parsing from
    archived HTML, no server traffic.
 
-**Unit + fixture tests:** `uv run pytest tests/` (39 tests, ~0.3s).
+**Unit + fixture tests:** `uv run pytest tests/` (71 tests, ~1s).
 
 ### Data source notes
 - Catchwords (`subject_tags`) are hierarchical: `Subject — Topic — Sub —
@@ -464,43 +457,10 @@ vars (handy for smoke tests — no code edits required):
 
 ---
 
-## Build Monitoring Guide (for AI agents)
+## Build monitoring
 
-This section helps AI agents monitoring the build pipeline interpret log output correctly.
-
-### What "no data returned" means for this repo
-
-The `judgments` resource is a **3-phase pipeline** that does real work even when SUMMARY says "0 succeeded":
-
-| Phase | What it does | Log signal | Shows in SUMMARY? |
-|-------|-------------|------------|-------------------|
-| Phase 1 (discovery) | Scrape eLitigation listing pages for new judgment metadata | `Discovery OK: N new records` (or `Discovery ABORTED (<reason>): ...` on stderr when the run stopped on a fetch/HTTP failure) | Yes — counted as "succeeded" if N > 0 |
-| Phase 2 (enrichment) | Fetch full HTML for existing rows with NULL content_text, extract paragraphs | `Phase 2 complete: N extracted, ... M NULL-content rows remain` | **No** — runs inside the same fetch_data() call but doesn't count as "succeeded" |
-| Phase 3 (summarisation) | LLM-generate summaries for rows with NULL summary | `Phase 3 complete: N summarised, ... m NULL-summary rows remain` | **No** — same reason |
-
-**Typical healthy build:** `SUMMARY: 1 succeeded, 0 failed, 0 skipped` with Phase 2 extracting 25 rows and Phase 3 summarising 25 rows. The "1 succeeded" is the discovery phase finding 1 new judgment. The 50 rows of enrichment work are invisible in SUMMARY.
-
-**"No data returned" is normal when:** Discovery found 0 new judgments (steady-state — all recent cases already in DB). Phase 2 and Phase 3 still run and process the backlog.
-
-**"No data returned" is abnormal when:** The eLitigation site is unreachable (network error, timeout). Check for `Connection error`, `RetryError`, `timeout` in the log.
-
-### Normal yield expectations
-
-- **New judgments:** 0–5 per day (court sitting days only — typically 1–3 on weekdays, 0 on weekends)
-- **Phase 2 enrichment:** 25 rows per run (EXTRACT_MAX_PER_RUN=25). Backlog: ~8,740 rows still NULL → ~350 days at 1 run/day
-- **Phase 3 summarisation:** 25 rows per run (SUMMARISE_MAX_PER_RUN=25). Backlog: ~884 rows still NULL → ~35 days at 1 run/day
-- **Build duration:** 30–45 minutes (dominated by Phase 2+3 LLM calls, not discovery)
-
-### Current DB stats (as of Jul 2026)
-
-- Total judgments: ~10,683
-- With content_text (enriched): ~1,943 (18%)
-- With summary (summarised): ~9,799 (92%)
-- Fragment rows: growing with each Phase 2 run
-
-### Failure modes to watch for
-
-1. **LLM endpoint down** — Phase 3 shows `llm failed: InternalServerError: Error code: 500`. Transient — retries next run.
-2. **eLitigation site down** — Phase 1 shows `Connection error` or `RetryError`. All subsequent phases skip.
-3. **Build duration > 1h** — Usually means Phase 2/3 are processing but LLM is slow. Not a failure unless > 2h.
-4. **`Phase 2: already ran this build` — skipping`** — Normal. Zeeker calls fetch_data() twice (once for main, once for fragments). The second call detects it already ran and skips.
+Operational knowledge — run narrative, status contract (Skip kinds,
+`__zeeker_report__` counters), cadence and yield expectations, failure
+modes, quarantine/checkpoint/cache recovery, and backlog SQL — lives in
+**RUNBOOK.md**. Monitoring agents should read that file, not this one.
+This file keeps development-specific guidance only.
