@@ -98,7 +98,15 @@ Do not conflate cited cases with the case before the court. Other named cases \
 and their parties are precedents the court discusses; their facts, holdings, and \
 monetary awards belong under **Reasons** (as authority applied, distinguished, or \
 overruled), never under **Facts** or **Holding**. **Facts** and **Holding** \
-describe only the dispute and decision in the present judgment.{anchor}"""
+describe only the dispute and decision in the present judgment.
+
+Transcribe party names, statute titles, and legal terms exactly as they appear \
+in the excerpts. Do not abbreviate, paraphrase, or alter names. Do not include \
+any meta-commentary about the excerpts or the summarisation process — output \
+only the three-section summary.
+
+If the new excerpts add nothing to the existing summary, output the existing \
+summary unchanged without any preamble.{anchor}"""
 
 # Per-row anchor appended to the system prompt so every batch call knows which
 # case is "the present case" — the model cannot otherwise tell the current
@@ -159,6 +167,207 @@ _META_PREFIX_RE = re.compile(
     r"Summary\s*\(Facts[^)]*\))\s*:?\s*",
     re.IGNORECASE,
 )
+
+# Rolling-pass commentary that leaks into the model's output as prose.
+# The model sometimes prefaced its response with meta-text about what the
+# new excerpts contained and why the summary was unchanged. These are NOT
+# simple prefixes — they are full sentences the model writes to itself.
+# Pattern: zero or more commentary paragraphs followed by the real content
+# (which starts with **Facts** or ## Facts or similar heading). We strip
+# everything before the first structural heading.
+_COMMENTARY_LEAK_RE = re.compile(
+    r"""^                          # start of text
+    (?:
+        (?:The\s+provided\s+(?:new\s+)?excerpts?   # "The provided excerpts..."
+           (?:contain|consist\s+of|are\s+empty|are\s+only)[^.]*\.
+        )
+        |(?:As\s+(?:there\s+is\s+no|these\s+do\s+not)[^.]*\.)
+        |(?:The\s+summary\s+remains\s+unchanged\.?)
+        |(?:As\s+these\s+do\s+not\s+introduce[^.]*\.)
+        |(?:Based\s+on\s+the\s+provided\s+(?:headings|excerpts)[^.]*\.)
+        |(?:I\s+have\s+initiated\s+the\s+summary\.?)
+        |(?:These\s+details\s+are\s+already\s+captured[^.]*\.)
+        |.*?currently\s+placeholder.*
+    )
+    \s*                           # optional whitespace
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+# Structural heading that marks the start of real summary content.
+_HEADING_LINE_RE = re.compile(
+    r"^\s*\*{0,2}\s*(Facts|Factual\s+Background|Background|Holding|Decision|Reasons|Analysis)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_commentary(text: str) -> str:
+    """Remove rolling-pass commentary that leaked into the summary output.
+
+    The model sometimes wrote prose about the excerpts it was processing
+    ("The provided new excerpts contain only the names of the legal
+    counsel...") before the actual summary. We strip everything before
+    the first structural heading (**Facts**, ## Holding, etc.) if the
+    text before that heading looks like meta-commentary.
+    """
+    if not text:
+        return text
+    # Fast path: if the text starts with a heading, there's no commentary.
+    if _HEADING_LINE_RE.match(text):
+        return text
+    # Find the first structural heading.
+    m = _HEADING_LINE_RE.search(text)
+    if m and m.start() > 0:
+        prefix = text[: m.start()].strip()
+        # Only strip if the prefix looks like commentary, not actual content.
+        # Commentary is short (a few sentences, no markdown structure).
+        if len(prefix) < 500 and not prefix.startswith("**"):
+            return text[m.start():].lstrip()
+    return text
+
+
+# ── LLM transcription-artifact cleanup ──────────────────────────────────────
+
+# Underscores inside words are tokenization artifacts (e.g. "E_ik" for "Eik").
+# Only fix when the underscore is between two letters — never in URLs, code,
+# or markdown formatting. We use word boundaries to avoid touching snake_case
+# identifiers that may legitimately appear.
+_UNDERSCORE_IN_NAME_RE = re.compile(r"(?<=[A-Za-z])_(?=[A-Za-z])")
+
+# Dollar sign before a Capital letter — common artifact where the model
+# drops an apostrophe or space (e.g. "Women's $Charter" → "Women's Charter").
+# Only replace when preceded by a word char + optional space/apostrophe.
+_DOLLAR_BEFORE_WORD_RE = re.compile(r"(?<=[a-z'\s])\$Charter\b", re.IGNORECASE)
+
+# Extra trailing consonants on names (e.g. "Khoon" → "Khoont") are harder
+# to detect generically; we handle the known cases via a small lookup.
+# This is intentionally conservative — only fixing observed artifacts.
+# NOTE: "Broadly" is NOT a transcription error — it is the judge's own
+# shorthand for "Broadley Engineering" in the judgment body text.
+_KNOWN_NAME_FIXES = {
+    "Khoont": "Khoon",
+    "Emplain": "Claim",
+}
+
+
+def _fix_transcription_artifacts(text: str) -> str:
+    """Fix common LLM tokenization artifacts in party names and legal terms.
+
+    These are NOT extraction errors — the source HTML and fragment text are
+    correct. The artifacts arise from the LLM's tokenization of proper nouns
+    and special characters, producing underscores, dollar signs, and extra
+    consonants in names.
+    """
+    if not text:
+        return text
+    # Fix underscores between letters in names (e.g. "E_ik" → "Eik").
+    text = _UNDERSCORE_IN_NAME_RE.sub("", text)
+    # Fix "$Charter" → "Charter" (dollar sign replacing apostrophe/space).
+    text = _DOLLAR_BEFORE_WORD_RE.sub("Charter", text)
+    # Fix HTML entities that leaked through from source markup.
+    text = _HTML_ENTITY_RE.sub(_decode_html_entity, text)
+    # Fix known name transcription errors.
+    for wrong, right in _KNOWN_NAME_FIXES.items():
+        text = text.replace(wrong, right)
+    return text
+
+
+# HTML entities that can appear when the LLM copies text containing
+# unresolved entities from the source HTML (e.g. &amp;, &ge;, &le;).
+_HTML_ENTITY_RE = re.compile(r"&(amp|lt|gt|ge|le|ne|quot|apos|nbsp);")
+_HTML_ENTITY_MAP = {
+    "amp": "&", "lt": "<", "gt": ">", "ge": "≥", "le": "≤",
+    "ne": "≠", "quot": '"', "apos": "'", "nbsp": " ",
+}
+
+
+def _decode_html_entity(m: re.Match) -> str:
+    return _HTML_ENTITY_MAP.get(m.group(1), m.group(0)) or m.group(0)
+
+
+# Trailing list-item / heading patterns that indicate incomplete content.
+# Key: must be a standalone line ending with a bare number+period, NOT a
+# decimal/dollar amount at the end of a sentence. We require the number to
+# be at the START of its line (preceded by start-of-line or whitespace only)
+# and followed by nothing but whitespace.
+_INCOMPLETE_TRAIL_RE = re.compile(
+    r"(?:"
+    r"(?:^|\n)\s*\d+\.\s*$"       # bare "2." on its own line at end
+    r"|(?:^|\n)\s*\d+\.\s*\*{0,2}\s*$"  # "2. **" on its own line at end
+    r"|(?:^|\n)\s*\*\*\d+\.\s*$"  # "**2." — truncated bold heading at end
+    r"|(?:^|\n)\s*\(\w+\)\s*$"    # bare "(a)" on its own line at end
+    r"|(?:^|\n)\s*[•\-\*]\s*$"    # trailing bullet on its own line
+    r")",
+)
+
+
+def _trim_to_complete(text: str, limit: int) -> str:
+    """Trim text to *limit* chars, ending at a complete sentence or list item.
+
+    Improves on the old ``rsplit(". ", 1)`` approach by also handling:
+    - Trailing list markers ("2." with nothing after) — trim back to the
+      previous complete item.
+    - Trailing markdown heading/bold openers ("**2." ) — trim back.
+    Returns the trimmed text with a closing period if the cut point was
+    mid-sentence.
+    """
+    if len(text) <= limit:
+        # Even when within limit, check for trailing incomplete items.
+        return _trim_trailing_incomplete(text)
+    chunk = text[:limit]
+
+    # If the chunk ends with an incomplete list item (e.g. "2." or "(a)"),
+    # trim back to the start of that item's line.
+    stripped = chunk.rstrip()
+    m = _INCOMPLETE_TRAIL_RE.search(stripped)
+    if m:
+        result = stripped[: m.start()].rstrip()
+        if result and not result.endswith((".", ":", "!", "?")):
+            result += "."
+        if result and len(result) < len(stripped):
+            return result
+
+    # Default: trim to last complete sentence within the limit.
+    trimmed = chunk.rsplit(". ", 1)
+    if len(trimmed) > 1 and len(trimmed[0]) > limit * 0.5:
+        return trimmed[0] + "."
+    # Fallback: look for the last period, newline, or list marker.
+    for sep in ["\n\n", "\n", ". ", ".\n"]:
+        idx = chunk.rfind(sep)
+        if idx > limit * 0.5:
+            result = chunk[:idx].rstrip()
+            if not result.endswith((".", ":", "!", "?")):
+                result += "."
+            return result
+    return chunk.rstrip() + "."
+
+
+def _trim_trailing_incomplete(text: str) -> str:
+    """Remove trailing incomplete list items (e.g. bare "2." or "(a)").
+
+    Unlike _trim_to_complete, this does NOT enforce a character limit —
+    it only strips trailing incomplete content, leaving the rest intact.
+    Used in the backfill to clean summaries that were truncated mid-list
+    by the LLM's token limit.
+    """
+    stripped = text.rstrip()
+    if not _INCOMPLETE_TRAIL_RE.search(stripped):
+        return text
+    # Find the start of the trailing incomplete item and trim there.
+    # The trailing item is a bare number/letter marker on its own line.
+    m = _INCOMPLETE_TRAIL_RE.search(stripped)
+    if m:
+        # Cut everything from the start of the trailing item's line.
+        # m.start() points to the \n before the bare number, or start of text.
+        cut = m.start()
+        # If the match starts with \n, we want to keep up to the \n.
+        # If it starts at position 0, trim everything (edge case).
+        result = stripped[:cut].rstrip()
+        if result and not result.endswith((".", ":", "!", "?")):
+            result += "."
+        if result and len(result) < len(stripped):
+            return result
+    return text
 
 
 # ── Token usage tracking ─────────────────────────────────────────────────────
@@ -447,15 +656,18 @@ def rolling_summarise(
             # Return the best summary we have so far — first-batch coverage is usually enough.
             break
 
+        # Strip rolling-pass commentary that leaked into the output.
+        summary = _strip_commentary(summary)
+
         # Prevent uncapped growth: _call_once returns partial content on finish_reason=length.
         # Without this guard, accumulated summary can reach 5k–20k tokens → overflows num_ctx
         # in the sanity-check pass (input=0 output tokens, content="", finish_reason=length).
         if len(summary) > limit:
-            trimmed = summary[:limit].rsplit(". ", 1)
-            summary = (trimmed[0] + ".") if len(trimmed) > 1 else summary[:limit]
+            summary = _trim_to_complete(summary, limit)
 
     # Pass 2: sanity check — strip Python-side artefacts first.
-    cleaned = _META_PREFIX_RE.sub("", summary).strip()
+    cleaned = _strip_commentary(_META_PREFIX_RE.sub("", summary).strip())
+    cleaned = _fix_transcription_artifacts(cleaned)
 
     # Skip the LLM call when Pass 1 already produced a clean, within-limit result.
     if len(cleaned) <= limit:
@@ -474,7 +686,7 @@ def rolling_summarise(
         timeout=timeout,
     )
 
-    return final
+    return _fix_transcription_artifacts(_strip_commentary(final))
 
 
 # ── Legacy single-pass path (retained for reference) ─────────────────────────

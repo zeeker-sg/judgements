@@ -17,6 +17,10 @@ import sqlite_utils
 
 from resources import summarization, summary_cache
 from resources.summarization import (
+    _fix_transcription_artifacts,
+    _strip_commentary,
+    _trim_to_complete,
+    _trim_trailing_incomplete,
     compose_summary_input,
     score_fragment,
 )
@@ -400,3 +404,206 @@ class TestSummariseRow:
         assert status == "cached"
         updated = dict(db["judgments"].rows_where("id = ?", ["abc123"]).__next__())
         assert updated["summary"] == "Cached paragraph."
+
+
+# ---------------------------------------------------------------------------
+# Commentary leak stripping
+# ---------------------------------------------------------------------------
+
+
+class TestStripCommentary:
+    def test_strips_leading_commentary_before_facts(self):
+        text = (
+            "The provided new excerpts contain only the names of the legal "
+            "counsel representing the defendants. As these do not introduce "
+            "new material facts, the summary remains unchanged.\n\n"
+            "**Facts**\nThe plaintiff sued the defendant."
+        )
+        result = _strip_commentary(text)
+        assert result.startswith("**Facts**")
+        assert "The provided" not in result
+
+    def test_strips_invoice_annex_commentary(self):
+        text = (
+            "The provided excerpts contain only annexes listing invoices for "
+            "legal fees. These details are already captured.\n\n"
+            "**Facts**\nVibrant Group acquired Blackgold."
+        )
+        result = _strip_commentary(text)
+        assert result.startswith("**Facts**")
+        assert "annexes" not in result
+
+    def test_strips_empty_excerpt_commentary(self):
+        text = (
+            "The provided excerpts are empty. As there is no new information "
+            "to incorporate, the summary remains unchanged.\n\n"
+            "**Facts**\nParties were married."
+        )
+        result = _strip_commentary(text)
+        assert result.startswith("**Facts**")
+
+    def test_strips_placeholder_commentary(self):
+        text = (
+            "Based on the provided headings, I have initiated the summary. "
+            "As the current excerpt only contains the table of contents, the "
+            "**Holding** and **Reasons** sections are currently placeholder.\n\n"
+            "**Facts**\nThe dispute arose."
+        )
+        result = _strip_commentary(text)
+        assert result.startswith("**Facts**")
+        assert "placeholder" not in result
+
+    def test_preserves_summary_without_commentary(self):
+        text = "**Facts**\nThe plaintiff sued the defendant."
+        result = _strip_commentary(text)
+        assert result == text
+
+    def test_preserves_summary_with_facts_paragraph_not_heading(self):
+        # Summary that starts with bold Facts but has no commentary
+        text = "**Facts**\nSome content here."
+        result = _strip_commentary(text)
+        assert result == text
+
+    def test_does_not_strip_long_prefix_that_is_content(self):
+        # If prefix is too long (>500 chars), it's real content, not commentary
+        text = "A" * 600 + "\n\n**Facts**\nMore content."
+        result = _strip_commentary(text)
+        assert result == text  # Unchanged
+
+
+# ---------------------------------------------------------------------------
+# Transcription artifact fixes
+# ---------------------------------------------------------------------------
+
+
+class TestFixTranscriptionArtifacts:
+    def test_fixes_underscore_in_name(self):
+        text = "against Chew E_ik Khoon (\"Chew\")"
+        result = _fix_transcription_artifacts(text)
+        assert "Eik Khoon" in result
+        assert "E_ik" not in result
+
+    def test_fixes_dollar_charter(self):
+        text = "under the Women's $Charter"
+        result = _fix_transcription_artifacts(text)
+        assert "Women's Charter" in result
+        assert "$Charter" not in result
+
+    def test_fixes_known_name_khoont(self):
+        text = "Chew Eik Khoont"
+        result = _fix_transcription_artifacts(text)
+        assert "Khoon" in result
+        assert "Khoont" not in result
+
+    def test_preserves_correct_text(self):
+        text = "Chew Eik Khoon appeared in court."
+        result = _fix_transcription_artifacts(text)
+        assert result == text
+
+    def test_fixes_multiple_underscores(self):
+        text = "M_r Smith and J_ones v Br_own"
+        result = _fix_transcription_artifacts(text)
+        assert "Mr Smith" in result
+        assert "Jones" in result
+        assert "Brown" in result
+
+    def test_fixes_html_entities(self):
+        text = "Nam Hong Construction &ge; Pte Ltd v Kori Construction"
+        result = _fix_transcription_artifacts(text)
+        assert "&ge;" not in result
+        assert "≥" in result
+
+    def test_fixes_html_amp_entity(self):
+        text = "Smith &amp; Jones"
+        result = _fix_transcription_artifacts(text)
+        assert result == "Smith & Jones"
+
+    def test_fixes_html_nbsp_entity(self):
+        text = "paragraph\xa01"  # actual nbsp, not entity
+        # HTML entity &nbsp; as literal text
+        text2 = "paragraph&nbsp;1"
+        result = _fix_transcription_artifacts(text2)
+        assert "&nbsp;" not in result
+        assert " " in result
+
+
+# ---------------------------------------------------------------------------
+# Trailing incomplete item trimming
+# ---------------------------------------------------------------------------
+
+
+class TestTrimTrailingIncomplete:
+    def test_trims_bare_number_at_end(self):
+        text = "Some content here.\n2."
+        result = _trim_trailing_incomplete(text)
+        assert result == "Some content here."
+
+    def test_trims_bare_number_with_blank_line(self):
+        text = "Some content here.\n\n2."
+        result = _trim_trailing_incomplete(text)
+        assert result == "Some content here."
+
+    def test_trims_bare_letter_at_end(self):
+        text = "Some content.\n(a)"
+        result = _trim_trailing_incomplete(text)
+        assert result == "Some content."
+
+    def test_trims_trailing_bullet(self):
+        text = "Some content.\n-"
+        result = _trim_trailing_incomplete(text)
+        assert result == "Some content."
+
+    def test_trims_truncated_bold_heading(self):
+        # "**2." — truncated bold heading (e.g. "**2. Standard of Care**")
+        text = "The court found X.\n\n**2."
+        result = _trim_trailing_incomplete(text)
+        assert result == "The court found X."
+
+    def test_preserves_complete_summary(self):
+        text = "**Facts**\nThe court found in favour of the plaintiff."
+        result = _trim_trailing_incomplete(text)
+        assert result == text
+
+    def test_preserves_decimal_at_end(self):
+        text = "The court awarded $5,711.11."
+        result = _trim_trailing_incomplete(text)
+        assert result == text
+
+    def test_preserves_year_at_end(self):
+        text = "The case was decided in 2025."
+        result = _trim_trailing_incomplete(text)
+        assert result == text
+
+    def test_preserves_dollar_amount_with_newline_after(self):
+        text = "Costs of $3,254.84 to $5,711.11."
+        result = _trim_trailing_incomplete(text)
+        assert result == text
+
+    def test_adds_period_if_missing(self):
+        text = "The court found X\n2."
+        result = _trim_trailing_incomplete(text)
+        assert result.endswith(".")
+        assert "2." not in result.split(".")[-1]
+
+
+class TestTrimToComplete:
+    def test_trims_to_last_sentence_within_limit(self):
+        text = "First sentence. Second sentence here."
+        result = _trim_to_complete(text, 20)
+        assert result.endswith(".")
+        assert "Second" not in result
+
+    def test_preserves_text_within_limit(self):
+        text = "Short content."
+        result = _trim_to_complete(text, 100)
+        assert result == "Short content."
+
+    def test_handles_trailing_incomplete_within_limit(self):
+        text = "Complete sentence.\n2."
+        result = _trim_to_complete(text, 100)
+        assert result == "Complete sentence."
+
+    def test_preserves_dollar_amount(self):
+        text = "The court awarded $5,711.11."
+        result = _trim_to_complete(text, 100)
+        assert "$5,711.11." in result
