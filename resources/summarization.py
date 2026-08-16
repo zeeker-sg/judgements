@@ -285,6 +285,113 @@ def _decode_html_entity(m: re.Match) -> str:
     return _HTML_ENTITY_MAP.get(m.group(1), m.group(0)) or m.group(0)
 
 
+# ── Summary smell test ───────────────────────────────────────────────────────
+#
+# Lightweight post-generation quality gate. Runs after every LLM call to
+# reject obviously bad summaries before they reach the DB. The checks are
+# all regex / string-based (no LLM call) so they add negligible latency.
+#
+# For the standalone audit (scripts/audit_summaries.py), the same function
+# is applied to every existing summary in the DB.
+
+# Minimum acceptable word count. Summaries shorter than this are almost
+# certainly truncated or empty LLM responses.
+_SMELL_MIN_WORDS = 50
+
+# Maximum prefix (before the first structural heading) that we tolerate.
+# Longer than this and it's likely real content, not commentary.
+_SMELL_MAX_PREFIX_CHARS = 500
+
+# Structural headings — the summary must have at least one.
+_SMELL_HEADING_RE = re.compile(
+    r"^\s*\*{0,2}\s*(Facts|Factual\s+Background|Background|Holding|Decision|Reasons|Analysis)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Commentary leak patterns — any of these at the start of the summary
+# means the rolling loop's self-talk leaked into the output.
+_SMELL_COMMENTARY_RE = re.compile(
+    r"^\s*(?:"
+    r"The\s+provided\s+(?:new\s+)?excerpts?"
+    r"|As\s+there\s+is\s+no\s+new"
+    r"|The\s+summary\s+remains\s+unchanged"
+    r"|Based\s+on\s+the\s+provided"
+    r"|I\s+have\s+initiated\s+the\s+summary"
+    r"|These\s+details\s+are\s+already\s+captured"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Mid-sentence truncation: summary doesn't end with terminal punctuation.
+_SMELL_TERMINAL_RE = re.compile(r"[.!?:)\]\"'`]$")
+
+# HTML entities that shouldn't appear in clean output.
+_SMELL_ENTITY_RE = re.compile(r"&(amp|lt|gt|ge|le|ne|quot|apos|nbsp|#\d+);")
+
+# Underscore between letters (tokenization artifact).
+_SMELL_UNDERSCORE_RE = re.compile(r"[A-Za-z]_[A-Za-z]")
+
+
+def smell_test(summary: str, *, fragment_count: int = 0) -> Dict[str, Any]:
+    """Lightweight quality gate for a generated summary.
+
+    Returns a dict with:
+        ``passed`` (bool): True if all checks pass.
+        ``issues`` (list[str]): Human-readable issue descriptions.
+        ``severity`` (str): "pass", "warn", or "fail".
+
+    A ``fail`` means the summary should not be persisted — treat it as an
+    LLM error and retry. A ``warn`` means the summary is acceptable but
+    has a minor issue worth logging.
+
+    All checks are regex/string-based — no LLM call, so this adds
+    negligible latency to the build pipeline.
+    """
+    issues: List[str] = []
+    if not summary or not summary.strip():
+        return {"passed": False, "issues": ["empty summary"], "severity": "fail"}
+
+    s = summary.strip()
+    wc = len(s.split())
+
+    # 1. Too short — likely truncated or empty LLM response.
+    # For judgments with few fragments, a short summary is expected.
+    # For larger judgments, scale the minimum up proportionally.
+    if fragment_count <= 20:
+        min_words = 20  # Floor for very short judgments
+    else:
+        min_words = max(_SMELL_MIN_WORDS, min(fragment_count // 5, 200))
+    if wc < min_words:
+        issues.append(f"too short: {wc} words (need ≥{min_words} for {fragment_count} fragments)")
+
+    # 2. No structural heading — missing Facts/Holding/Reasons.
+    if not _SMELL_HEADING_RE.search(s):
+        issues.append("no structural heading (Facts/Holding/Reasons)")
+
+    # 3. Commentary leak at the start.
+    if _SMELL_COMMENTARY_RE.search(s[:500]):
+        issues.append("commentary leak at start")
+
+    # 4. Mid-sentence truncation — doesn't end with terminal punctuation.
+    if not _SMELL_TERMINAL_RE.search(s.rstrip()[-1:]):
+        issues.append("ends without terminal punctuation (possible truncation)")
+
+    # 5. Trailing incomplete list marker.
+    if _INCOMPLETE_TRAIL_RE.search(s.rstrip()):
+        issues.append("trailing incomplete list marker")
+
+    # 6. HTML entities in the text.
+    if _SMELL_ENTITY_RE.search(s):
+        issues.append("HTML entity in text")
+
+    # 7. Underscore-in-name artifact.
+    if _SMELL_UNDERSCORE_RE.search(s):
+        issues.append("underscore in name (tokenization artifact)")
+
+    severity = "fail" if issues else "pass"
+    return {"passed": not issues, "issues": issues, "severity": severity}
+
+
 # Trailing list-item / heading patterns that indicate incomplete content.
 # Key: must be a standalone line ending with a bare number+period, NOT a
 # decimal/dollar amount at the end of a sentence. We require the number to

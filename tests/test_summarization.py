@@ -23,6 +23,7 @@ from resources.summarization import (
     _trim_trailing_incomplete,
     compose_summary_input,
     score_fragment,
+    smell_test,
 )
 
 
@@ -330,7 +331,13 @@ class TestSummariseRow:
         monkeypatch.setattr(
             judgments_mod.summarization,
             "rolling_summarise",
-            lambda row, fragments, model, client, **kwargs: ("Stub summary paragraph of the judgment."),
+            lambda row, fragments, model, client, **kwargs: (
+                "**Facts**\nThe plaintiff sued the defendant for breach of contract. "
+                "The dispute concerns a commercial lease agreement dated 2019. "
+                "The defendant failed to pay rent for six consecutive months.\n\n"
+                "**Holding**\nThe court found for the plaintiff and awarded damages.\n\n"
+                "**Reasons**\nThe defendant failed to perform its obligations under the lease."
+            ),
         )
         # summary_cache is likewise a separate module object; use the
         # one judgments_mod imported so its writes land in our tmp dir.
@@ -343,12 +350,24 @@ class TestSummariseRow:
 
         assert status == "ok"
         updated = dict(db["judgments"].rows_where("id = ?", ["abc123"]).__next__())
-        assert updated["summary"] == "Stub summary paragraph of the judgment."
+        assert updated["summary"] == (
+            "**Facts**\nThe plaintiff sued the defendant for breach of contract. "
+            "The dispute concerns a commercial lease agreement dated 2019. "
+            "The defendant failed to pay rent for six consecutive months.\n\n"
+            "**Holding**\nThe court found for the plaintiff and awarded damages.\n\n"
+            "**Reasons**\nThe defendant failed to perform its obligations under the lease."
+        )
         assert updated["summary_generated_at"]  # ISO timestamp set.
         # Cache file written via the module judgments_mod imported.
         cached = sc_mod.read_summary("abc123")
         assert cached is not None
-        assert cached["summary"] == "Stub summary paragraph of the judgment."
+        assert cached["summary"] == (
+            "**Facts**\nThe plaintiff sued the defendant for breach of contract. "
+            "The dispute concerns a commercial lease agreement dated 2019. "
+            "The defendant failed to pay rent for six consecutive months.\n\n"
+            "**Holding**\nThe court found for the plaintiff and awarded damages.\n\n"
+            "**Reasons**\nThe defendant failed to perform its obligations under the lease."
+        )
         assert cached["model"] == "stub-model"
 
     def test_uses_cached_summary_when_present(self, tmp_path, monkeypatch):
@@ -607,3 +626,85 @@ class TestTrimToComplete:
         text = "The court awarded $5,711.11."
         result = _trim_to_complete(text, 100)
         assert "$5,711.11." in result
+
+
+# ---------------------------------------------------------------------------
+# Smell test — post-generation quality gate
+# ---------------------------------------------------------------------------
+
+
+class TestSmellTest:
+    def test_passes_good_summary(self):
+        text = "**Facts**\nThe plaintiff sued the defendant for breach.\n\n**Holding**\nThe court found for the plaintiff.\n\n**Reasons**\nThe defendant failed to perform."
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is True
+        assert result["severity"] == "pass"
+
+    def test_fails_empty_summary(self):
+        result = smell_test("")
+        assert result["passed"] is False
+        assert "empty summary" in result["issues"]
+
+    def test_fails_too_short(self):
+        text = "**Facts**\nShort."
+        result = smell_test(text, fragment_count=300)
+        assert result["passed"] is False
+        assert any("too short" in i for i in result["issues"])
+
+    def test_fails_no_heading(self):
+        text = "The court dismissed the appeal because the appellant failed to establish grounds for review." * 5
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("no structural heading" in i for i in result["issues"])
+
+    def test_fails_commentary_leak(self):
+        text = (
+            "The provided new excerpts contain only the names of the legal counsel. "
+            "The summary remains unchanged.\n\n"
+            "**Facts**\nThe plaintiff sued the defendant. " * 10
+        )
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("commentary leak" in i for i in result["issues"])
+
+    def test_fails_mid_sentence_truncation(self):
+        text = "**Facts**\nThe plaintiff sued the defendant for breach of contract and the court found that the"
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("terminal punctuation" in i for i in result["issues"])
+
+    def test_fails_html_entity(self):
+        text = "**Facts**\nThe court cited Nam Hong Construction &ge; Pte Ltd in its ruling. " * 10
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("HTML entity" in i for i in result["issues"])
+
+    def test_fails_underscore_artifact(self):
+        text = "**Facts**\nThe claim was brought by Chew E_ik Khoon against the defendant. " * 10
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("underscore" in i for i in result["issues"])
+
+    def test_fails_trailing_incomplete(self):
+        text = "**Facts**\nThe court found for the plaintiff.\n\n**Reasons**\n1. First reason.\n2."
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("trailing incomplete" in i for i in result["issues"])
+
+    def test_min_words_scales_with_fragments(self):
+        # 500 fragments → min 100 words, summary has ~25 → should fail
+        text = "**Facts**\n" + "The court found for the plaintiff. " * 10  # ~30 words
+        result = smell_test(text, fragment_count=500)
+        assert result["passed"] is False
+        assert any("too short" in i for i in result["issues"])
+
+    def test_small_fragment_count_allows_short_summary(self):
+        # 10 fragments → min 20 words, 18-word summary should pass the word check
+        text = "**Facts**\nThe plaintiff sued the defendant for breach.\n\n**Holding**\nThe court found for the plaintiff.\n\n**Reasons**\nThe defendant failed to perform."
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is True
+
+    def test_passes_with_just_enough_words(self):
+        text = "**Facts**\n" + "The court found for the plaintiff. " * 10
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is True
