@@ -17,8 +17,13 @@ import sqlite_utils
 
 from resources import summarization, summary_cache
 from resources.summarization import (
+    _fix_transcription_artifacts,
+    _strip_commentary,
+    _trim_to_complete,
+    _trim_trailing_incomplete,
     compose_summary_input,
     score_fragment,
+    smell_test,
 )
 
 
@@ -326,7 +331,13 @@ class TestSummariseRow:
         monkeypatch.setattr(
             judgments_mod.summarization,
             "rolling_summarise",
-            lambda row, fragments, model, client, **kwargs: ("Stub summary paragraph of the judgment."),
+            lambda row, fragments, model, client, **kwargs: (
+                "**Facts**\nThe plaintiff sued the defendant for breach of contract. "
+                "The dispute concerns a commercial lease agreement dated 2019. "
+                "The defendant failed to pay rent for six consecutive months.\n\n"
+                "**Holding**\nThe court found for the plaintiff and awarded damages.\n\n"
+                "**Reasons**\nThe defendant failed to perform its obligations under the lease."
+            ),
         )
         # summary_cache is likewise a separate module object; use the
         # one judgments_mod imported so its writes land in our tmp dir.
@@ -339,12 +350,24 @@ class TestSummariseRow:
 
         assert status == "ok"
         updated = dict(db["judgments"].rows_where("id = ?", ["abc123"]).__next__())
-        assert updated["summary"] == "Stub summary paragraph of the judgment."
+        assert updated["summary"] == (
+            "**Facts**\nThe plaintiff sued the defendant for breach of contract. "
+            "The dispute concerns a commercial lease agreement dated 2019. "
+            "The defendant failed to pay rent for six consecutive months.\n\n"
+            "**Holding**\nThe court found for the plaintiff and awarded damages.\n\n"
+            "**Reasons**\nThe defendant failed to perform its obligations under the lease."
+        )
         assert updated["summary_generated_at"]  # ISO timestamp set.
         # Cache file written via the module judgments_mod imported.
         cached = sc_mod.read_summary("abc123")
         assert cached is not None
-        assert cached["summary"] == "Stub summary paragraph of the judgment."
+        assert cached["summary"] == (
+            "**Facts**\nThe plaintiff sued the defendant for breach of contract. "
+            "The dispute concerns a commercial lease agreement dated 2019. "
+            "The defendant failed to pay rent for six consecutive months.\n\n"
+            "**Holding**\nThe court found for the plaintiff and awarded damages.\n\n"
+            "**Reasons**\nThe defendant failed to perform its obligations under the lease."
+        )
         assert cached["model"] == "stub-model"
 
     def test_uses_cached_summary_when_present(self, tmp_path, monkeypatch):
@@ -400,3 +423,288 @@ class TestSummariseRow:
         assert status == "cached"
         updated = dict(db["judgments"].rows_where("id = ?", ["abc123"]).__next__())
         assert updated["summary"] == "Cached paragraph."
+
+
+# ---------------------------------------------------------------------------
+# Commentary leak stripping
+# ---------------------------------------------------------------------------
+
+
+class TestStripCommentary:
+    def test_strips_leading_commentary_before_facts(self):
+        text = (
+            "The provided new excerpts contain only the names of the legal "
+            "counsel representing the defendants. As these do not introduce "
+            "new material facts, the summary remains unchanged.\n\n"
+            "**Facts**\nThe plaintiff sued the defendant."
+        )
+        result = _strip_commentary(text)
+        assert result.startswith("**Facts**")
+        assert "The provided" not in result
+
+    def test_strips_invoice_annex_commentary(self):
+        text = (
+            "The provided excerpts contain only annexes listing invoices for "
+            "legal fees. These details are already captured.\n\n"
+            "**Facts**\nVibrant Group acquired Blackgold."
+        )
+        result = _strip_commentary(text)
+        assert result.startswith("**Facts**")
+        assert "annexes" not in result
+
+    def test_strips_empty_excerpt_commentary(self):
+        text = (
+            "The provided excerpts are empty. As there is no new information "
+            "to incorporate, the summary remains unchanged.\n\n"
+            "**Facts**\nParties were married."
+        )
+        result = _strip_commentary(text)
+        assert result.startswith("**Facts**")
+
+    def test_strips_placeholder_commentary(self):
+        text = (
+            "Based on the provided headings, I have initiated the summary. "
+            "As the current excerpt only contains the table of contents, the "
+            "**Holding** and **Reasons** sections are currently placeholder.\n\n"
+            "**Facts**\nThe dispute arose."
+        )
+        result = _strip_commentary(text)
+        assert result.startswith("**Facts**")
+        assert "placeholder" not in result
+
+    def test_preserves_summary_without_commentary(self):
+        text = "**Facts**\nThe plaintiff sued the defendant."
+        result = _strip_commentary(text)
+        assert result == text
+
+    def test_preserves_summary_with_facts_paragraph_not_heading(self):
+        # Summary that starts with bold Facts but has no commentary
+        text = "**Facts**\nSome content here."
+        result = _strip_commentary(text)
+        assert result == text
+
+    def test_does_not_strip_long_prefix_that_is_content(self):
+        # If prefix is too long (>500 chars), it's real content, not commentary
+        text = "A" * 600 + "\n\n**Facts**\nMore content."
+        result = _strip_commentary(text)
+        assert result == text  # Unchanged
+
+
+# ---------------------------------------------------------------------------
+# Transcription artifact fixes
+# ---------------------------------------------------------------------------
+
+
+class TestFixTranscriptionArtifacts:
+    def test_fixes_underscore_in_name(self):
+        text = "against Chew E_ik Khoon (\"Chew\")"
+        result = _fix_transcription_artifacts(text)
+        assert "Eik Khoon" in result
+        assert "E_ik" not in result
+
+    def test_fixes_dollar_charter(self):
+        text = "under the Women's $Charter"
+        result = _fix_transcription_artifacts(text)
+        assert "Women's Charter" in result
+        assert "$Charter" not in result
+
+    def test_fixes_known_name_khoont(self):
+        text = "Chew Eik Khoont"
+        result = _fix_transcription_artifacts(text)
+        assert "Khoon" in result
+        assert "Khoont" not in result
+
+    def test_preserves_correct_text(self):
+        text = "Chew Eik Khoon appeared in court."
+        result = _fix_transcription_artifacts(text)
+        assert result == text
+
+    def test_fixes_multiple_underscores(self):
+        text = "M_r Smith and J_ones v Br_own"
+        result = _fix_transcription_artifacts(text)
+        assert "Mr Smith" in result
+        assert "Jones" in result
+        assert "Brown" in result
+
+    def test_fixes_html_entities(self):
+        text = "Nam Hong Construction &ge; Pte Ltd v Kori Construction"
+        result = _fix_transcription_artifacts(text)
+        assert "&ge;" not in result
+        assert "≥" in result
+
+    def test_fixes_html_amp_entity(self):
+        text = "Smith &amp; Jones"
+        result = _fix_transcription_artifacts(text)
+        assert result == "Smith & Jones"
+
+    def test_fixes_html_nbsp_entity(self):
+        text = "paragraph\xa01"  # actual nbsp, not entity
+        # HTML entity &nbsp; as literal text
+        text2 = "paragraph&nbsp;1"
+        result = _fix_transcription_artifacts(text2)
+        assert "&nbsp;" not in result
+        assert " " in result
+
+
+# ---------------------------------------------------------------------------
+# Trailing incomplete item trimming
+# ---------------------------------------------------------------------------
+
+
+class TestTrimTrailingIncomplete:
+    def test_trims_bare_number_at_end(self):
+        text = "Some content here.\n2."
+        result = _trim_trailing_incomplete(text)
+        assert result == "Some content here."
+
+    def test_trims_bare_number_with_blank_line(self):
+        text = "Some content here.\n\n2."
+        result = _trim_trailing_incomplete(text)
+        assert result == "Some content here."
+
+    def test_trims_bare_letter_at_end(self):
+        text = "Some content.\n(a)"
+        result = _trim_trailing_incomplete(text)
+        assert result == "Some content."
+
+    def test_trims_trailing_bullet(self):
+        text = "Some content.\n-"
+        result = _trim_trailing_incomplete(text)
+        assert result == "Some content."
+
+    def test_trims_truncated_bold_heading(self):
+        # "**2." — truncated bold heading (e.g. "**2. Standard of Care**")
+        text = "The court found X.\n\n**2."
+        result = _trim_trailing_incomplete(text)
+        assert result == "The court found X."
+
+    def test_preserves_complete_summary(self):
+        text = "**Facts**\nThe court found in favour of the plaintiff."
+        result = _trim_trailing_incomplete(text)
+        assert result == text
+
+    def test_preserves_decimal_at_end(self):
+        text = "The court awarded $5,711.11."
+        result = _trim_trailing_incomplete(text)
+        assert result == text
+
+    def test_preserves_year_at_end(self):
+        text = "The case was decided in 2025."
+        result = _trim_trailing_incomplete(text)
+        assert result == text
+
+    def test_preserves_dollar_amount_with_newline_after(self):
+        text = "Costs of $3,254.84 to $5,711.11."
+        result = _trim_trailing_incomplete(text)
+        assert result == text
+
+    def test_adds_period_if_missing(self):
+        text = "The court found X\n2."
+        result = _trim_trailing_incomplete(text)
+        assert result.endswith(".")
+        assert "2." not in result.split(".")[-1]
+
+
+class TestTrimToComplete:
+    def test_trims_to_last_sentence_within_limit(self):
+        text = "First sentence. Second sentence here."
+        result = _trim_to_complete(text, 20)
+        assert result.endswith(".")
+        assert "Second" not in result
+
+    def test_preserves_text_within_limit(self):
+        text = "Short content."
+        result = _trim_to_complete(text, 100)
+        assert result == "Short content."
+
+    def test_handles_trailing_incomplete_within_limit(self):
+        text = "Complete sentence.\n2."
+        result = _trim_to_complete(text, 100)
+        assert result == "Complete sentence."
+
+    def test_preserves_dollar_amount(self):
+        text = "The court awarded $5,711.11."
+        result = _trim_to_complete(text, 100)
+        assert "$5,711.11." in result
+
+
+# ---------------------------------------------------------------------------
+# Smell test — post-generation quality gate
+# ---------------------------------------------------------------------------
+
+
+class TestSmellTest:
+    def test_passes_good_summary(self):
+        text = "**Facts**\nThe plaintiff sued the defendant for breach.\n\n**Holding**\nThe court found for the plaintiff.\n\n**Reasons**\nThe defendant failed to perform."
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is True
+        assert result["severity"] == "pass"
+
+    def test_fails_empty_summary(self):
+        result = smell_test("")
+        assert result["passed"] is False
+        assert "empty summary" in result["issues"]
+
+    def test_fails_too_short(self):
+        text = "**Facts**\nShort."
+        result = smell_test(text, fragment_count=300)
+        assert result["passed"] is False
+        assert any("too short" in i for i in result["issues"])
+
+    def test_fails_no_heading(self):
+        text = "The court dismissed the appeal because the appellant failed to establish grounds for review." * 5
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("no structural heading" in i for i in result["issues"])
+
+    def test_fails_commentary_leak(self):
+        text = (
+            "The provided new excerpts contain only the names of the legal counsel. "
+            "The summary remains unchanged.\n\n"
+            "**Facts**\nThe plaintiff sued the defendant. " * 10
+        )
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("commentary leak" in i for i in result["issues"])
+
+    def test_fails_mid_sentence_truncation(self):
+        text = "**Facts**\nThe plaintiff sued the defendant for breach of contract and the court found that the"
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("terminal punctuation" in i for i in result["issues"])
+
+    def test_fails_html_entity(self):
+        text = "**Facts**\nThe court cited Nam Hong Construction &ge; Pte Ltd in its ruling. " * 10
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("HTML entity" in i for i in result["issues"])
+
+    def test_fails_underscore_artifact(self):
+        text = "**Facts**\nThe claim was brought by Chew E_ik Khoon against the defendant. " * 10
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("underscore" in i for i in result["issues"])
+
+    def test_fails_trailing_incomplete(self):
+        text = "**Facts**\nThe court found for the plaintiff.\n\n**Reasons**\n1. First reason.\n2."
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is False
+        assert any("trailing incomplete" in i for i in result["issues"])
+
+    def test_min_words_scales_with_fragments(self):
+        # 500 fragments → min 100 words, summary has ~25 → should fail
+        text = "**Facts**\n" + "The court found for the plaintiff. " * 10  # ~30 words
+        result = smell_test(text, fragment_count=500)
+        assert result["passed"] is False
+        assert any("too short" in i for i in result["issues"])
+
+    def test_small_fragment_count_allows_short_summary(self):
+        # 10 fragments → min 20 words, 18-word summary should pass the word check
+        text = "**Facts**\nThe plaintiff sued the defendant for breach.\n\n**Holding**\nThe court found for the plaintiff.\n\n**Reasons**\nThe defendant failed to perform."
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is True
+
+    def test_passes_with_just_enough_words(self):
+        text = "**Facts**\n" + "The court found for the plaintiff. " * 10
+        result = smell_test(text, fragment_count=10)
+        assert result["passed"] is True

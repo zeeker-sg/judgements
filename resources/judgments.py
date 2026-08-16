@@ -929,6 +929,12 @@ def _summarise_row(
     if not summary_text:
         return "error", "empty response"
 
+    # Smell test: reject obviously bad summaries before persisting.
+    frag_count = row.get("fragment_count") or len(fragments)
+    result = summarization.smell_test(summary_text, fragment_count=frag_count)
+    if not result["passed"]:
+        return "error", f"smell_test: {'; '.join(result['issues'])}"
+
     now_iso = datetime.now().isoformat(timespec="seconds")
     endpoint = endpoint or os.environ.get("LLM_BASE_URL", "")
     summary_cache.write_summary_atomic(
