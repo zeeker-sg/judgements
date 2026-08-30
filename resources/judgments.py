@@ -74,6 +74,7 @@ import extraction_cache
 import httpx
 import summarization
 import summary_cache
+from _provenance import record_provenance, prompt_hash as _prompt_hash, source_hash as _source_hash
 from bs4 import BeautifulSoup
 from extraction import ExtractionError
 from sqlite_utils.db import Table
@@ -84,6 +85,13 @@ from tenacity import (
     wait_exponential,
 )
 from zeeker import Skip
+
+# ── Provenance: prompt hashes computed once at module load ───────────────────
+# Tracks which prompt version produced each summary. When the prompt changes,
+# the hash changes, making it possible to query "which summaries came from
+# which prompt version" via the _zeeker_provenance table.
+_PHASH_ROLLING = _prompt_hash(summarization.ROLLING_SYSTEM_PROMPT)
+_PHASH_SANITY = _prompt_hash(summarization._SANITY_SYSTEM)
 
 # =============================================================================
 # CONFIGURATION
@@ -576,6 +584,16 @@ def _push_cached_extraction_to_db(existing_table: Table, jid: str, cached: Dict[
     )
     _insert_fragments(existing_table.db, cached.get("fragments") or [])
 
+    # Provenance: record cached extraction metadata.
+    record_provenance(
+        existing_table.db,
+        table_name="judgments",
+        record_id=jid,
+        extractor="extraction.py BeautifulSoup (cached)",
+        source_url=cached.get("source_url"),
+        processing_notes=f"extracted: {len(cached.get('fragments') or [])} frags (cached)",
+    )
+
 
 def _enrich_row(
     client: httpx.Client,
@@ -672,6 +690,18 @@ def _enrich_row(
         },
     )
     _insert_fragments(existing_table.db, extracted.fragments)
+
+    # Provenance: record extraction metadata for this judgment.
+    record_provenance(
+        existing_table.db,
+        table_name="judgments",
+        record_id=jid,
+        extractor="extraction.py BeautifulSoup",
+        source_url=source_url,
+        source_hash=_source_hash(extracted.content_text) if extracted.content_text else None,
+        processing_notes=f"extracted: {len(extracted.fragments)} frags",
+    )
+
     return "ok", (
         f"{len(extracted.fragments)} frags, "
         f"{sum(1 for f in extracted.fragments if f['has_footnotes'])} w/fn"
@@ -909,6 +939,18 @@ def _summarise_row(
             },
         )
         existing_table.db.conn.commit()
+
+        # Provenance: record cached summary metadata.
+        record_provenance(
+            existing_table.db,
+            table_name="judgments",
+            record_id=jid,
+            model=cached.get("model", ""),
+            prompt_hash=_PHASH_ROLLING,
+            llm_endpoint=cached.get("endpoint", ""),
+            source_url=row.get("source_url"),
+            processing_notes=f"summary: cached, {len(cached['summary'])} chars",
+        )
         return "cached", None
 
     fragments = (
@@ -954,6 +996,18 @@ def _summarise_row(
         {"summary": summary_text, "summary_generated_at": now_iso},
     )
     existing_table.db.conn.commit()
+
+    # Provenance: record summary metadata for this judgment.
+    record_provenance(
+        existing_table.db,
+        table_name="judgments",
+        record_id=jid,
+        model=model,
+        prompt_hash=_PHASH_ROLLING,
+        llm_endpoint=endpoint,
+        source_url=row.get("source_url"),
+        processing_notes=f"summary: ok, {len(summary_text)} chars, {len(fragments)} frags",
+    )
     return "ok", f"{len(summary_text)} chars"
 
 
