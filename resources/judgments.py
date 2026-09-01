@@ -100,6 +100,16 @@ USER_AGENT = "ZeekerBot/1.0 (+https://data.zeeker.sg)"
 
 # Crawl pacing (env-overridable so smoke tests don't require code edits)
 MAX_PAGES_PER_RUN = int(os.environ.get("JUDGMENTS_MAX_PAGES_PER_RUN", "50"))
+# Coverage floor: always fully scan the first N listing pages before the
+# steady-state early exit is honoured. eLitigation publishes some judgments
+# days/weeks after their decision date; they slot into the date-sorted
+# listing at their decision-date position (below newer arrivals), so early
+# pages can hold long runs of known IDs while deeper pages still hold
+# unseen rows. 0 restores the old first-trip stop.
+MIN_PAGES_PER_RUN = int(os.environ.get("JUDGMENTS_MIN_PAGES_PER_RUN", "10"))
+if MIN_PAGES_PER_RUN > MAX_PAGES_PER_RUN:
+    # The batch cap bounds the pages walked per run; the floor cannot exceed it.
+    MIN_PAGES_PER_RUN = MAX_PAGES_PER_RUN
 INCREMENTAL_STOP_THRESHOLD = int(os.environ.get("JUDGMENTS_INCREMENTAL_STOP", "5"))
 REQUEST_DELAY_BASE = float(os.environ.get("JUDGMENTS_DELAY_BASE", "1.5"))
 REQUEST_DELAY_JITTER = float(os.environ.get("JUDGMENTS_DELAY_JITTER", "0.5"))
@@ -1168,8 +1178,9 @@ def _run_phase3(existing_table: Optional[Table]) -> Dict[str, int]:
 def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     """Discover judgment catalog records from listing pages.
 
-    Respects ``MAX_PAGES_PER_RUN`` (batch limit) and
-    ``INCREMENTAL_STOP_THRESHOLD`` (steady-state early exit).
+    Respects ``MIN_PAGES_PER_RUN`` (guaranteed coverage floor),
+    ``MAX_PAGES_PER_RUN`` (batch limit) and ``INCREMENTAL_STOP_THRESHOLD``
+    (steady-state early exit, honoured only from page MIN+1 onward).
     State persisted to ``checkpoint_judgments_discovery.json``.
 
     Runs exactly once per build (zeeker >= 0.9.0 single-fetch lifecycle),
@@ -1190,6 +1201,9 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     staged: List[Dict[str, Any]] = [
         r for r in checkpoint.get("items_collected", []) if r["id"] not in existing_ids
     ]
+    # Staged-but-not-yet-inserted items must be treated as known, or the walk
+    # below re-discovers them from the listing and stages them a second time.
+    existing_ids.update(r["id"] for r in staged)
     total_pages: Optional[int] = checkpoint.get("total_pages")
 
     breaker = CircuitBreaker()
@@ -1272,6 +1286,22 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                     if item["id"] in existing_ids:
                         consecutive_known += 1
                         if consecutive_known >= INCREMENTAL_STOP_THRESHOLD:
+                            if pages_this_run < MIN_PAGES_PER_RUN:
+                                # Coverage floor: late-published judgments
+                                # slot into the listing at their decision-date
+                                # position (below the new arrivals), so the
+                                # first pages can contain long runs of known
+                                # IDs even when deeper pages hold unseen
+                                # rows. Keep walking through the guaranteed
+                                # pages; reset the counter so the threshold
+                                # applies fresh from page MIN+1 onward.
+                                click.echo(
+                                    f"  {consecutive_known} consecutive known IDs "
+                                    f"within guaranteed pages "
+                                    f"({pages_this_run + 1}/{MIN_PAGES_PER_RUN}) — continuing."
+                                )
+                                consecutive_known = 0
+                                continue
                             click.echo(
                                 f"Stopping: {consecutive_known} consecutive known IDs — "
                                 f"steady-state mode."
