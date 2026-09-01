@@ -177,8 +177,13 @@ three phases in order:
    metadata. During the initial archive crawl it walks up to
    `JUDGMENTS_MAX_PAGES_PER_RUN` pages per build, resuming from
    `checkpoint_judgments_discovery.json`. In steady state it stops after
-   `JUDGMENTS_INCREMENTAL_STOP` consecutive already-known IDs (usually
-   within page 1) and clears the checkpoint. New rows are returned to
+   `JUDGMENTS_INCREMENTAL_STOP` consecutive already-known IDs — but only
+   after fully scanning the first `JUDGMENTS_MIN_PAGES_PER_RUN` pages
+   (coverage floor: late-published judgments slot into the listing at
+   their decision-date position, below newer arrivals, so early pages
+   can hold long runs of known IDs while deeper pages still hold unseen
+   rows). In steady state the walk typically ends within the guaranteed
+   pages and clears the checkpoint. New rows are returned to
    zeeker for insert; content columns start NULL.
 2. **Phase 2 — enrichment.** Reuses the same `httpx.Client`. Picks up to
    `JUDGMENTS_EXTRACT_MAX_PER_RUN` rows with `content_text IS NULL`
@@ -231,7 +236,8 @@ are no CI secrets because deployment is not wired up yet.
 | Env var | Default | What it controls |
 |---|---|---|
 | `JUDGMENTS_MAX_PAGES_PER_RUN` | `50` | Phase 1: batch cap on listing pages per invocation. Set to `2` for smoke tests. |
-| `JUDGMENTS_INCREMENTAL_STOP` | `5` | Phase 1: consecutive already-known IDs before steady-state early exit. |
+| `JUDGMENTS_MIN_PAGES_PER_RUN` | `10` | Phase 1: coverage floor — always fully scan the first N listing pages before the steady-state known-ID early exit is honoured (from page N+1 onward). Late-published judgments slot into the date-sorted listing at their decision-date position, so early pages can hold long runs of known IDs while deeper pages still hold unseen rows. `0` restores the original first-trip stop. Clamped to `JUDGMENTS_MAX_PAGES_PER_RUN` when larger. |
+| `JUDGMENTS_INCREMENTAL_STOP` | `5` | Phase 1: consecutive already-known IDs before early exit (suppressed within the `JUDGMENTS_MIN_PAGES_PER_RUN` floor). |
 | `JUDGMENTS_DELAY_BASE` / `JUDGMENTS_DELAY_JITTER` | `1.5` / `0.5` | Phase 1: polite sleep (s) between listing fetches, +/- jitter. |
 | `JUDGMENTS_EXTRACT_ENABLED` | `1` | Phase 2: `0` = discovery only (skip enrichment). |
 | `JUDGMENTS_EXTRACT_MAX_PER_RUN` | `50` | Phase 2: max docs enriched per build. |
@@ -257,8 +263,9 @@ are no CI secrets because deployment is not wired up yet.
 
 ## Cadence & expected yield
 
-- **Schedule:** daily `uv run zeeker build judgments` (run by the owner's
-  agent/host trigger; no GitHub Actions deploy wired up yet).
+- **Schedule:** every 6 hours at :07 UTC (`7 */6 * * *` in the system
+  crontab, via `~/.local/bin/zeeker-build zeeker-judgements`; log at
+  `~/logs/cron/zeeker-judgements.log`).
 - **New judgments (Phase 1):** 0–5 per day — typically 1–3 on court
   sitting days, 0 on weekends/holidays. `records` on the `[OK]` line, or
   `[SKIP] … no data returned` with counters in steady state.
