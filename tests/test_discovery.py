@@ -210,3 +210,36 @@ def test_checkpoint_preserved_when_batch_cap_hits_mid_floor(tmp_path, monkeypatc
     saved = json.loads(checkpoint.read_text())
     assert saved["last_page"] == 2
     assert {i["id"] for i in saved["items_collected"]} == {"new-1", "new-2"}
+
+
+def test_checkpoint_staged_items_not_restaged_on_rediscovery(tmp_path, monkeypatch):
+    """A staged checkpoint item must not be re-staged when the walk also
+    finds it on the listing (observed live 2026-09-01: SGHC 178 inserted
+    twice — once from a hand-staged checkpoint, once from page-1 discovery).
+    Staged IDs join the known set before the walk starts."""
+    monkeypatch.setattr(judgments, "MIN_PAGES_PER_RUN", 0)
+    checkpoint = tmp_path / "checkpoint.json"
+    # The checkpoint stages 'staged-1'; page 1's listing contains it too.
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "last_page": 0,
+                "items_collected": [dict(make_item("staged-1"), extra="ctx")],
+                "total_pages": None,
+            }
+        )
+    )
+    pages = {
+        1: [make_item("staged-1"), make_item("staged-2"), make_item("fresh-1")]
+        + [make_item("old-1")] * 5,
+        "_checkpoint": checkpoint,
+    }
+    install_pages(monkeypatch, pages)
+
+    staged = judgments.fetch_data(FakeTable(["old-1"]))
+
+    # staged-1 stays single-staged (its checkpoint copy), staged-2 and
+    # fresh-1 come from the walk; nothing appears twice.
+    ids = sorted(s["id"] for s in staged)
+    assert ids == ["fresh-1", "staged-1", "staged-2"]
+    assert len(ids) == len(set(ids))

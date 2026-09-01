@@ -1201,6 +1201,9 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     staged: List[Dict[str, Any]] = [
         r for r in checkpoint.get("items_collected", []) if r["id"] not in existing_ids
     ]
+    # Staged-but-not-yet-inserted items must be treated as known, or the walk
+    # below re-discovers them from the listing and stages them a second time.
+    existing_ids.update(r["id"] for r in staged)
     total_pages: Optional[int] = checkpoint.get("total_pages")
 
     breaker = CircuitBreaker()
