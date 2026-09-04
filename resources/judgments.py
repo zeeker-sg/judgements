@@ -723,6 +723,16 @@ def _run_phase2(
     existing_table.db.execute(
         "CREATE INDEX IF NOT EXISTS idx_judgments_created_at ON judgments(created_at)"
     )
+    # Index decision_date for the same reason: the public browse page
+    # (data.zeeker.sg/zeeker-judgements/judgments) lists rows ordered by
+    # decision_date DESC. Without this index the default listing
+    # (SELECT rowid, * ... ORDER BY decision_date DESC LIMIT 101) full-scans
+    # and sorts the multi-GB table, intermittently exceeding datasette's
+    # sql_time_limit_ms → 400 "SQL query took too long" → frontend 503s
+    # (observed since Jul 2026, see datasette-500-favicon-csv-errors).
+    existing_table.db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_judgments_decision_date ON judgments(decision_date)"
+    )
 
     state = load_extraction_state()
     now = datetime.now()
