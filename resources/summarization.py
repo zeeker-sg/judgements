@@ -527,8 +527,18 @@ def make_client():
 
 
 def make_client_alt():
-    """Build an alt OpenAI-compatible client, or return None when unconfigured."""
-    base_url = os.environ.get("LLM_BASE_URL_2", "").strip()
+    """Build an alt OpenAI-compatible client, or return None when unconfigured.
+
+    When ``LLM_BASE_URL_2`` is unset but the primary ``LLM_BASE_URL`` is
+    configured, the alt client reuses the primary base URL — the common
+    single-proxy deployment where one Ollama endpoint serves both models
+    (only ``LLM_MODEL_2`` / ``LLM_API_KEY_2`` differ). Returns None only when
+    no LLM endpoint is configured at all.
+    """
+    base_url = (
+        os.environ.get("LLM_BASE_URL_2", "").strip()
+        or os.environ.get("LLM_BASE_URL", "").strip()
+    )
     if not base_url:
         return None
     from openai import OpenAI
@@ -614,7 +624,16 @@ def _call_once(
     """
     base_url = str(getattr(client, "base_url", ""))
     ollama_url = os.environ.get("LLM_BASE_URL", "").strip()
-    is_ollama = base_url.rstrip("/").endswith("/v1") and base_url == ollama_url
+    # The OpenAI SDK normalises base_url with a trailing slash (e.g.
+    # "http://host:11434/v1/"), so a direct string comparison against the raw
+    # env value never matched and the native-Ollama branch was dead code.
+    # Compare with trailing slashes stripped on both sides instead.
+    client_origin = base_url.rstrip("/")
+    is_ollama = (
+        bool(ollama_url)
+        and client_origin.endswith("/v1")
+        and client_origin == ollama_url.rstrip("/")
+    )
     if is_ollama:
         return _call_once_native_ollama(
             messages, model, base_url, max_tokens=max_tokens, timeout=timeout
@@ -632,6 +651,13 @@ def _call_once(
         timeout=timeout,
         extra_body={
             "think": False,
+            # Reasoning models (kimi-k2.6, nemotron) burn the token budget on a
+            # separate `reasoning` field through the OpenAI-compatible layer —
+            # `think: False` is NOT honoured there, so the call dies with
+            # finish_reason=length and empty content. `reasoning_effort=none`
+            # disables thinking server-side (verified on kimi-k2.6:cloud);
+            # models without thinking support ignore the field.
+            "reasoning_effort": "none",
             "repeat_penalty": _SUMMARY_REPEAT_PENALTY,
             "top_k": _SUMMARY_TOP_K,
         },
