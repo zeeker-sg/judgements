@@ -270,7 +270,7 @@ class TestGoldSampleFixes:
 
     @pytest.mark.parametrize(
         "sentence, provision",
-        [("(“CPR”) r 17.4 gave effect", "r 17.4"), ("Art 26.1 of the Contract", "Art 26.1")],
+        [("(“CPR”) r 17.4 gave effect", "r 17.4"), ("Art 26.1 of the Convention", "Art 26.1")],
     )
     def test_dotted_provision_numbers(self, sentence, provision):
         assert only(sentence, "PROVISION").text == provision
@@ -281,3 +281,56 @@ class TestGoldSampleFixes:
 
     def test_contract_number_is_not_a_case_number(self):
         assert spans("(Contract No GB013/2021P), under which", "CASE_NUMBER") == []
+
+
+class TestCaseFileDocuments:
+    """Decision 14: contracts, pleadings and affidavits are not instruments."""
+
+    @pytest.mark.parametrize(
+        "sentence",
+        [
+            "Art 26.1 of the Contract",
+            "Art 3 of the Charterparty",
+            "Art 4 of the Charter Party dated 1 May",
+            "r 5 of the Sale and Purchase Agreement",
+            "s 11 of the Policy",
+            # Pleadings, affidavits and submissions (also decision 14).
+            "para 12 of the Statement of Claim",
+            "paras 5-7 of the Reply",
+            "para 20 of the 1st Affidavit of Tan Ah Kow dated 3 May 2024",
+            "at para 8 of his AEIC",
+            "the Plaintiff’s Closing Submissions at para 45",
+        ],
+    )
+    def test_document_paragraph_is_not_a_provision(self, sentence):
+        assert spans(sentence, "PROVISION") == []
+
+    @pytest.mark.parametrize(
+        "sentence, provision",
+        [
+            ("s 3 of the Unfair Contract Terms Act 1977", "s 3"),
+            ("under r 17.4 of the SIAC Rules", "r 17.4"),
+            ("Art 7 of the Charter", "Art 7"),
+            ("s 2 of the Act defines Agreement", "s 2"),
+        ],
+    )
+    def test_instrument_provisions_still_count(self, sentence, provision):
+        assert only(sentence, "PROVISION").text == provision
+
+
+class TestDocumentsNamedAfterProvisions:
+    """Decision 15: "section 122(6) statement" names a document, not the section."""
+
+    @pytest.mark.parametrize(
+        "sentence",
+        [
+            "in his section 122(6) statement, the accused",
+            "the s 23 statement recorded on 3 May",
+            "his s 22 statements",
+        ],
+    )
+    def test_named_document_is_not_a_provision(self, sentence):
+        assert spans(sentence, "PROVISION") == []
+
+    def test_section_itself_is_still_a_provision(self):
+        assert only("the cautioned statement under s 23 of the CPC", "PROVISION").text == "s 23"

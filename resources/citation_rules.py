@@ -30,7 +30,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-DETECTOR_VERSION = "rules-2"
+DETECTOR_VERSION = "rules-3"
 
 # ---------------------------------------------------------------------------
 # Citations: [year] vol ABBR page, one pattern for neutral and reported forms
@@ -217,6 +217,20 @@ PROVISION_RE = re.compile(
     r")(?![\w%])"
 )
 
+# Decision 14: a contract is not an instrument, so "Art 26.1 of the Contract"
+# is not a PROVISION. The contract word must end the title, so "s 3 of the
+# Unfair Contract Terms Act" still counts.
+CONTRACT_AFTER_RE = re.compile(
+    r"\s+(?:of|in|to|under)\s+(?:the\s+|this\s+|that\s+|its\s+|their\s+)?"
+    r"(?:(?:[A-Z][\w’'-]*|and|of|for)\s+){0,4}?"
+    r"(?:Contract|Subcontract|Sub-[Cc]ontract|Agreement|Deed|Lease|Tenancy|Charterparty"
+    r"|Charter\s?[Pp]arty|SPA|Policy|Terms|Conditions|Guarantee|Bond|Memorandum)s?\b"
+    r"(?![ \t]+[A-Z])"
+)
+# Decision 15: in "his section 122(6) statement" or "the s 23 statement" the
+# number is part of the document's name, not a reference to the section.
+NAMED_DOCUMENT_AFTER_RE = re.compile(r"\s+statements?\b")
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -390,6 +404,9 @@ def detect(text: str) -> List[Mention]:
             )
 
     for m in PROVISION_RE.finditer(text):
+        end = m.end("prov")
+        if CONTRACT_AFTER_RE.match(text, end) or NAMED_DOCUMENT_AFTER_RE.match(text, end):
+            continue
         found.append(
             Mention(
                 m.start("prov"),
