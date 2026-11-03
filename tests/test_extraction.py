@@ -408,6 +408,77 @@ class TestWhitespaceNormalization:
 
 
 # ---------------------------------------------------------------------------
+# Inline markup and nested footnote modals
+# ---------------------------------------------------------------------------
+
+
+class TestInlineText:
+    """Inline tags add no whitespace; block boundaries add exactly one space."""
+
+    def test_word_split_across_spans_is_rejoined(self):
+        # Seen in [2026] SGDC: "Lee H</span><span>sien Loong".
+        ej = _extract_from_divj(
+            '<div class="Judg-1">1 see <span class="font-italic ">Lee H</span>'
+            '<span class="font-italic ">sien Loong v Leong Sze Hian </span>'
+            "<span>[2021] 4 SLR 1128 at [45]. </span></div>"
+        )
+        assert ej.fragments[0]["content_text"] == (
+            "see Lee Hsien Loong v Leong Sze Hian [2021] 4 SLR 1128 at [45]."
+        )
+
+    def test_italic_short_name_inside_quotes_not_padded(self):
+        ej = _extract_from_divj(
+            '<div class="Judg-1">1 <span>[2024] 5 SLR 194 (“</span>'
+            '<span class="font-italic ">KS v LHY</span><span>”) at [21].</span></div>'
+        )
+        assert "(“KS v LHY”)" in ej.fragments[0]["content_text"]
+
+    def test_block_children_and_br_become_single_spaces(self):
+        ej = _extract_from_divj(
+            '<div class="Judg-Lawyers"><p>Counsel A</p><p>Counsel B<br/>for the claimant</p></div>'
+        )
+        assert ej.fragments[0]["content_text"] == "Counsel A Counsel B for the claimant"
+
+    def test_table_cells_rejoin_split_words(self):
+        t = BeautifulSoup(
+            "<table><tr><td><span>Dam</span><span>ages</span></td><td>$10,000</td></tr></table>",
+            "lxml",
+        ).find("table")
+        assert "Damages | $10,000" in absorb_table(t)
+
+
+class TestNestedFootnoteModal:
+    """Newer judgments nest each footnote modal inside the citing paragraph."""
+
+    HTML = (
+        '<html><body><div id="divJudgement">'
+        '<div class="Judg-1">5 Not much is known about the Defendant.'
+        "<sup><button type='button' data-toggle='modal' data-target='#fn-abc'>2</button></sup>"
+        "<div class='modal fade' id='fn-abc'><div class='modal-dialog'><div class='modal-content'>"
+        "<div class='modal-header'><h5 class='modal-title'>Foot Note 2</h5>"
+        "<button type='button' class='close'><span>&times;</span></button></div>"
+        "<div class='modal-body'><div class='FootnoteRef'> Affidavit of Ng dated 26 December"
+        " 2025 (“RN AEIC”), Exhibit A, at 39.</div></div>"
+        "</div></div></div> </div>"
+        "</div></body></html>"
+    )
+
+    def test_modal_and_marker_removed_from_paragraph_text(self):
+        para = extract_judgment(self.HTML, "x").fragments[0]
+        assert para["content_text"] == "Not much is known about the Defendant."
+
+    def test_footnote_text_keeps_only_modal_body(self):
+        para = extract_judgment(self.HTML, "x").fragments[0]
+        assert json.loads(para["footnote_text"]) == [
+            "Affidavit of Ng dated 26 December 2025 (“RN AEIC”), Exhibit A, at 39."
+        ]
+
+    def test_bare_sup_without_link_is_kept(self):
+        ej = _extract_from_divj('<div class="Judg-1">1\xa0A claim<sup>[note: 1]</sup>.</div>')
+        assert ej.fragments[0]["content_text"] == "A claim[note: 1]."
+
+
+# ---------------------------------------------------------------------------
 # extraction_cache corruption handling
 # ---------------------------------------------------------------------------
 
