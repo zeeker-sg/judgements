@@ -8,12 +8,17 @@ to the same case (short names, abbreviations) is step 2, and linking to
 
 Labels follow Blackstone's scheme, adapted (it spells ``CASENAME``):
 
-- ``CITATION``    a law-report or neutral citation, ``[1999] 2 SLR(R) 462``
+- ``CITATION``    a law-report or neutral citation, ``[1999] 2 SLR(R) 462``;
+                  law journal articles are not citations
+- ``CASE_NUMBER`` a court file number, ``CA/CCA 20/2022``, ``Suit No 123 of 2019``
 - ``CASE_NAME``   the case name written right before a citation
 - ``SHORT_NAME``  a name defined in brackets right after a citation or Act,
                   ``(“KS v LHY”)``; the span is the quoted name only
 - ``INSTRUMENT``  an Act, Code, Charter, Rules or Regulations title
-- ``PROVISION``   a section, rule, order or article reference, ``s 52(14)``
+- ``PROVISION``   a section, rule, order or article reference, ``s 52(14)``,
+                  or a paragraph of a Schedule (``para 4`` of the First Schedule)
+
+The edge cases are settled in the design doc's "Labelling guide" tab.
 
 Phase 0 (``extraction.element_text``) is assumed: no U+00A0, no padded
 quotes, no words split across inline tags.
@@ -25,7 +30,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-DETECTOR_VERSION = "rules-1"
+DETECTOR_VERSION = "rules-2"
 
 # ---------------------------------------------------------------------------
 # Citations: [year] vol ABBR page, one pattern for neutral and reported forms
@@ -42,6 +47,28 @@ CITATION_RE = re.compile(
     r"\s*(?P<page>\d{1,5})(?!\d)"
     # UK neutral citations carry a division suffix: [2011] EWHC 123 (Ch)
     r"(?:\s\((?P<div>Ch|QB|KB|Comm|Fam|TCC|Admin|Pat|IPEC)\))?"
+)
+
+# Law journals cite like reports but are not judgments (guide, decision 3).
+# MLJ and CLJ are law reports, so the list is explicit.
+JOURNAL_ABBR_RE = re.compile(
+    r"^(?:SAcLJ|SJLS|Sing JLS|LQR|MLR|OJLS|JBL|LMCLQ|HKLJ|CLP|Asian JCL|[A-Z][\w.]*\s?L\s?Rev)$"
+)
+
+# ---------------------------------------------------------------------------
+# Court file numbers: CA/CCA 20/2022, HC/SUM 1629/2025, Suit No 123 of 2019
+# ---------------------------------------------------------------------------
+
+CASE_NUMBER_RE = re.compile(
+    r"(?<![\w/])(?P<num>"
+    r"(?:[A-Z]{2,4}/)?[A-Z]{1,6}\s\d{1,5}/\d{4}(?![\w/])"
+    r"|(?:[A-Z][\w’']*\s+){1,4}No\.?\s*\d{1,5}\s+of\s+\d{4}(?!\d)"
+    r")"
+)
+_CASE_NUMBER_LEAD_STOP = {"In", "The", "See", "Under", "By", "And", "Of", "On", "For"}
+# "Act No 5 of 2010" numbers legislation, not a court file.
+_NOT_A_CASE_NUMBER_RE = re.compile(
+    r"\b(?:Act|Bill|Ordinance|Notification|Gazette|Order|Rules?|Regulations?)\s+No\b"
 )
 
 SG_NEUTRAL_ABBR_RE = re.compile(r"^SG[A-Z]+(?:\([A-Z]\))?$")
@@ -152,7 +179,7 @@ INSTRUMENT_RE = re.compile(
     r"(?:[A-Z][\w’'-]*\s+)"
     r"(?:(?:[A-Z][\w’'()-]*|of|and|the|for|in|on|to|&)\s+){0,10}?"
     # A second keyword continues the title: "Energy Charter Treaty".
-    rf"{_STATUTE_KEYWORD}(?:\s+{_STATUTE_KEYWORD})?"
+    rf"{_STATUTE_KEYWORD}(?:\s+{_STATUTE_KEYWORD})?\b"
     r"(?:\s+of\s+(?:the\s+)?[A-Z][\w’']*(?:\s+(?:of\s+)?[A-Z][\w’']*)*)?"
     r"|Rules\s+of\s+Court"
     r")"
@@ -178,9 +205,14 @@ _INSTRUMENT_NOT_TITLE_WORDS = {
 PROVISION_RE = re.compile(
     # Not after an apostrophe: "Respondent’s 25%" is a possessive, not s 25.
     r"(?<![\w(’'])(?P<prov>"
+    # A paragraph of a Schedule: "para 4 of the First Schedule"
+    r"paras?\s*\d+[A-Z]*(?:\(\w{1,5}\))*"
+    r"(?:(?:\s+and\s+|,\s*|\s*[–-]\s*)\d+[A-Z]*(?:\(\w{1,5}\))*)*"
+    r"(?=\s+(?:of|to|in)\s+(?:the\s+)?(?:\w+\s+)?Schedule\b)"
     # Rules of Court: O 3 r 2(8)
+    r"|"
     r"O\s*\d+[A-Z]?\s+rr?\s*\d+[A-Z]*(?:\(\w{1,5}\))*"
-    r"|(?:ss?|sections?|regs?|rr?|Arts?|arts?)\s*\d+[A-Z]*(?:\(\w{1,5}\))*"
+    r"|(?:ss?|sections?|regs?|rr?|Arts?|arts?)\s*\d+(?:\.\d+)*[A-Z]*(?:\(\w{1,5}\))*"
     r"(?:(?:\s*[–-]\s*|\s+to\s+|\s+and\s+|,\s*)(?:\d+[A-Z]*(?:\(\w{1,5}\))*|(?:\(\w{1,5}\))+))*"
     r")(?![\w%])"
 )
@@ -253,6 +285,8 @@ def detect(text: str) -> List[Mention]:
     found: List[Mention] = []
 
     for m in CITATION_RE.finditer(text):
+        if JOURNAL_ABBR_RE.match(re.sub(r"\s+", " ", m.group("abbr"))):
+            continue
         pinpoint, definition = _trailing(text, m.end())
         found.append(
             Mention(
@@ -279,6 +313,25 @@ def detect(text: str) -> List[Mention]:
                     meta={"defined_after": m.start()},
                 )
             )
+
+    for m in CASE_NUMBER_RE.finditer(text):
+        if _NOT_A_CASE_NUMBER_RE.search(m.group("num")):
+            continue
+        start = m.start("num")
+        # "In Suit No 123 of 2019" -> "Suit No 123 of 2019"
+        for tok in _TOKEN_RE.finditer(m.group("num")):
+            if tok.group(0) not in _CASE_NUMBER_LEAD_STOP:
+                start = m.start("num") + tok.start()
+                break
+        found.append(
+            Mention(
+                start,
+                m.end("num"),
+                "CASE_NUMBER",
+                text[start : m.end("num")],
+                normalised=re.sub(r"\s+", " ", text[start : m.end("num")]),
+            )
+        )
 
     for m in INSTRUMENT_RE.finditer(text):
         start = m.start("title")
@@ -350,7 +403,14 @@ def detect(text: str) -> List[Mention]:
     return _resolve_overlaps(found)
 
 
-_PRIORITY = {"CITATION": 0, "CASE_NAME": 1, "SHORT_NAME": 1, "INSTRUMENT": 2, "PROVISION": 3}
+_PRIORITY = {
+    "CITATION": 0,
+    "CASE_NUMBER": 0,
+    "CASE_NAME": 1,
+    "SHORT_NAME": 1,
+    "INSTRUMENT": 2,
+    "PROVISION": 3,
+}
 
 
 def _resolve_overlaps(mentions: List[Mention]) -> List[Mention]:

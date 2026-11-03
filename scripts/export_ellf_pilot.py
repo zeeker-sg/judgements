@@ -12,13 +12,21 @@ Output lines look like:
 
 Run:  uv run python scripts/export_ellf_pilot.py OUT.jsonl [ID ...]
       (no IDs = every judgment in the local DB that has content)
+
+With ``--units PATH`` it exports the sampled gold-set units written by
+``scripts/sample_gold_fragments.py`` instead. Units are interleaved round
+robin across court-level/era strata, so however far the annotator gets,
+the labelled part stays spread across strata.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
+from collections import defaultdict
+from itertools import zip_longest
 from pathlib import Path
 
 import sqlite_utils
@@ -37,12 +45,45 @@ def task(text: str, meta: dict) -> dict:
     }
 
 
+def export_units(units_path: Path, out_path: Path, seed: int) -> tuple:
+    rng = random.Random(seed)
+    strata = defaultdict(list)
+    for line in units_path.open(encoding="utf-8"):
+        u = json.loads(line)
+        strata[(u["level"], u["era"])].append(u)
+    queues = []
+    for key in sorted(strata):
+        rng.shuffle(strata[key])
+        queues.append(strata[key])
+    rng.shuffle(queues)
+    n_tasks = n_spans = 0
+    with out_path.open("w", encoding="utf-8") as out:
+        for row in zip_longest(*queues):
+            for u in row:
+                if u is None:
+                    continue
+                meta = {k: u[k] for k in ("citation", "fragment_id", "part", "level", "era")}
+                meta.update(judgment=meta.pop("citation"), split=u["split"], signal=u["signal"])
+                t = task(u["text"], meta)
+                out.write(json.dumps(t, ensure_ascii=False) + "\n")
+                n_tasks += 1
+                n_spans += len(t["spans"])
+    return len(strata), n_tasks, n_spans
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("out", type=Path)
     parser.add_argument("ids", nargs="*", help="judgment ids (default: all with content)")
     parser.add_argument("--db", default=str(ROOT / "zeeker-judgements.db"))
+    parser.add_argument("--units", type=Path, help="sampled units.jsonl to export instead")
+    parser.add_argument("--seed", type=int, default=20261104)
     args = parser.parse_args()
+
+    if args.units:
+        n_strata, n_tasks, n_spans = export_units(args.units, args.out, args.seed)
+        print(f"{n_strata} strata, {n_tasks} tasks, {n_spans} pre-filled spans -> {args.out}")
+        return 0
 
     db = sqlite_utils.Database(args.db)
     if args.ids:

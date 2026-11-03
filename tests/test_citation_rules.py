@@ -41,7 +41,6 @@ class TestCitations:
             ("[1917] P 271", "[1917] P 271", "other_report"),
             ("[2015] EWCA Civ 123", "[2015] EWCA Civ 123", "other_report"),
             ("[2011] EWHC 456 (Ch)", "[2011] EWHC 456 (Ch)", "other_report"),
-            ("(2019) 31 SAcLJ 123", "(2019) 31 SAcLJ 123", "other_report"),
         ],
     )
     def test_forms(self, text, normalised, kind):
@@ -216,3 +215,69 @@ def test_mentions_are_sorted_and_do_not_overlap():
         "PROVISION",
         "INSTRUMENT",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Labelling guide decisions (design doc, "Labelling guide" tab)
+# ---------------------------------------------------------------------------
+
+
+class TestGuideDecisions:
+    @pytest.mark.parametrize(
+        "sentence, number",
+        [
+            ("his appeal in CA/CCA 20/2022 was dismissed", "CA/CCA 20/2022"),
+            ("a defamation action in DC/OC 1154/2025 (“OC 1154”)", "DC/OC 1154/2025"),
+            ("the costs of HC/SUM 1629/2025", "HC/SUM 1629/2025"),
+            ("the costs order for SUM 1371/2025", "SUM 1371/2025"),
+            ("In Suit No 123 of 2019, the plaintiff", "Suit No 123 of 2019"),
+            ("Magistrate’s Appeal No 9091 of 2015", "Magistrate’s Appeal No 9091 of 2015"),
+        ],
+    )
+    def test_case_number(self, sentence, number):
+        assert only(sentence, "CASE_NUMBER").text == number
+
+    def test_act_number_is_not_a_case_number(self):
+        assert spans("amended by Act No 5 of 2010", "CASE_NUMBER") == []
+
+    def test_short_name_after_case_number_is_not_labelled(self):
+        # Decision 7: "OC 1154" names the proceeding, not a case or Act.
+        assert spans("an action in DC/OC 1154/2025 (“OC 1154”)", "SHORT_NAME") == []
+
+    @pytest.mark.parametrize(
+        "text", ["(2019) 31 SAcLJ 123", "[2015] SJLS 45", "(2012) 128 LQR 1", "(2010) 22 SAcLJ 1"]
+    )
+    def test_journal_articles_are_not_citations(self, text):
+        assert spans(f"see Tan, {text} at 5.", "CITATION") == []
+
+    def test_malayan_law_journal_is_a_report(self):
+        assert only("see [1985] 1 MLJ 123.", "CITATION").kind == "other_report"
+
+    @pytest.mark.parametrize(
+        "sentence, provision",
+        [
+            ("under para 4 of the First Schedule to the Act", "para 4"),
+            ("paras 4 and 5 of the Second Schedule", "paras 4 and 5"),
+            ("para 2(a) of Schedule 2", "para 2(a)"),
+        ],
+    )
+    def test_schedule_paragraph_is_a_provision(self, sentence, provision):
+        assert only(sentence, "PROVISION").text == provision
+
+
+class TestGoldSampleFixes:
+    """False positives and cut-offs found in the 200-judgment gold sample."""
+
+    @pytest.mark.parametrize(
+        "sentence, provision",
+        [("(“CPR”) r 17.4 gave effect", "r 17.4"), ("Art 26.1 of the Contract", "Art 26.1")],
+    )
+    def test_dotted_provision_numbers(self, sentence, provision):
+        assert only(sentence, "PROVISION").text == provision
+
+    def test_charterer_is_not_a_charter(self):
+        text = "after service of the Enforcement Order and the Charterer not having paid"
+        assert spans(text, "INSTRUMENT") == []
+
+    def test_contract_number_is_not_a_case_number(self):
+        assert spans("(Contract No GB013/2021P), under which", "CASE_NUMBER") == []
