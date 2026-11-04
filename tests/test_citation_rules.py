@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from resources.citation_rules import detect, detect_judgment
+from resources.citation_rules import detect, detect_judgment, detect_parts
 
 
 def spans(text: str, label: str | None = None):
@@ -516,3 +516,21 @@ class TestShortNamesInJudgment:
 
     def test_party_after_provision_is_not_a_short_name(self):
         assert spans("the inquiry under s 33B(2)(b) in the PP", "SHORT_NAME") == []
+
+    def test_detect_parts_reads_footnotes_after_their_paragraph(self):
+        fragments = [
+            {
+                "id": "j_0001",
+                "content_text": "the Evidence Act 1893 (“EA”) applies",
+                "footnote_text": '["s 32 of the EA"]',
+            },
+            {"id": "j_0002", "content_text": "Under the EA, it is", "footnote_text": None},
+        ]
+        parts = detect_parts(fragments)
+        assert list(parts) == [
+            ("j_0001", "content"),
+            ("j_0001", "footnote 1"),
+            ("j_0002", "content"),
+        ]
+        text, mentions = parts[("j_0002", "content")]
+        assert [(m.text, m.kind) for m in mentions] == [("EA", "use")]

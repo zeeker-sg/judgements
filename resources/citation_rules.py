@@ -31,6 +31,7 @@ quotes, no words split across inline tags.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Set
@@ -465,6 +466,28 @@ def detect_judgment(texts: Iterable[str]) -> List[List[Mention]]:
         known |= defined_names(mentions)
         out.append(mentions)
     return out
+
+
+def judgment_parts(fragments: Iterable[dict]) -> List[tuple]:
+    """``(fragment_id, part, text)`` for each string of a judgment, in reading order.
+
+    ``fragments`` are ``judgments_fragments`` rows (or ``extract_judgment``
+    fragments) in ordinal order; a fragment's footnotes follow its content.
+    ``part`` is "content" or "footnote N", as in the Ellf task meta.
+    """
+    parts = []
+    for f in fragments:
+        parts.append((f["id"], "content", f["content_text"] or ""))
+        notes = json.loads(f["footnote_text"]) if f["footnote_text"] else []
+        parts += [(f["id"], f"footnote {i}", note) for i, note in enumerate(notes, 1)]
+    return parts
+
+
+def detect_parts(fragments: Iterable[dict]) -> dict:
+    """``{(fragment_id, part): (text, mentions)}`` for a whole judgment."""
+    parts = judgment_parts(fragments)
+    mentions = detect_judgment(text for _, _, text in parts)
+    return {(fid, part): (text, ms) for (fid, part, text), ms in zip(parts, mentions)}
 
 
 def _uses(text: str, names: Iterable[str]) -> List[Mention]:

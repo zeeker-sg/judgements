@@ -1,14 +1,17 @@
 """Export judgment text as Prodigy/Ellf span tasks, pre-filled by the rules.
 
 One task per paragraph and one per footnote, in document order, with the
-spans from ``resources.citation_rules.detect`` attached so the annotator
-corrects rather than starts from blank. Every paragraph is exported, with
-or without detections, so the gold set can measure what the rules miss.
+spans the rules find attached so the annotator corrects rather than starts
+from blank. The rules run over the whole judgment in reading order
+(``detect_judgment``), as production will, so a short name defined in an
+earlier paragraph is already marked. Every paragraph is exported, with or
+without detections, so the gold set can measure what the rules miss.
 
 Output lines look like:
   {"text": "...", "spans": [{"start": 4, "end": 20, "label": "CITATION"}],
    "meta": {"judgment": "[2026] SGDC 136", "fragment_id": "…_0012",
-            "part": "content" | "footnote 1", "detector": "rules-1"}}
+            "part": "content" | "footnote 1", "detector": "rules-4",
+            "context": "judgment"}}
 
 Run:  uv run python scripts/export_ellf_pilot.py OUT.jsonl [ID ...]
       (no IDs = every judgment in the local DB that has content)
@@ -16,12 +19,17 @@ Run:  uv run python scripts/export_ellf_pilot.py OUT.jsonl [ID ...]
 With ``--units PATH`` it exports the sampled gold-set units written by
 ``scripts/sample_gold_fragments.py`` instead. Units are interleaved round
 robin across court-level/era strata, so however far the annotator gets,
-the labelled part stays spread across strata.
+the labelled part stays spread across strata. Each unit's judgment is
+re-extracted from the sampler's HTML cache for context; a unit whose
+judgment is missing there falls back to the passage alone, marked
+``"context": "passage"``. ``--skip PATH`` leaves out units already answered
+in an Ellf export.
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import random
 import sys
@@ -34,18 +42,46 @@ import sqlite_utils
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from resources.citation_rules import DETECTOR_VERSION, detect  # noqa: E402
+from resources import extraction  # noqa: E402
+from resources.citation_rules import DETECTOR_VERSION, detect, detect_parts  # noqa: E402
+
+GOLD_HTML = ROOT / ".cache" / "gold_sample" / "html"
 
 
-def task(text: str, meta: dict) -> dict:
+def task(text: str, mentions, meta: dict) -> dict:
     return {
         "text": text,
-        "spans": [{"start": m.start, "end": m.end, "label": m.label} for m in detect(text)],
+        "spans": [{"start": m.start, "end": m.end, "label": m.label} for m in mentions],
         "meta": {**meta, "detector": DETECTOR_VERSION},
     }
 
 
-def export_units(units_path: Path, out_path: Path, seed: int) -> tuple:
+def unit_mentions(unit: dict, cache: dict) -> tuple:
+    """Mentions for a sampled unit, run over its whole judgment when the HTML is cached."""
+    jid = unit["judgment_id"]
+    if jid not in cache:
+        path = GOLD_HTML / f"{jid}.html.gz"
+        try:
+            html = gzip.decompress(path.read_bytes()).decode("utf-8")
+            cache[jid] = detect_parts(extraction.extract_judgment(html, jid).fragments)
+        except (OSError, extraction.ExtractionError):
+            cache[jid] = {}
+    found = cache[jid].get((unit["fragment_id"], unit["part"]))
+    if found and found[0] == unit["text"]:
+        return found[1], "judgment"
+    return detect(unit["text"]), "passage"
+
+
+def answered_keys(path: Path) -> set:
+    """``(fragment_id, part)`` of every task answered in an Ellf dataset export."""
+    keys = set()
+    for line in path.open(encoding="utf-8"):
+        meta = json.loads(line).get("meta", {})
+        keys.add((meta.get("fragment_id"), meta.get("part")))
+    return keys
+
+
+def export_units(units_path: Path, out_path: Path, seed: int, skip: set = frozenset()) -> tuple:
     rng = random.Random(seed)
     strata = defaultdict(list)
     for line in units_path.open(encoding="utf-8"):
@@ -56,19 +92,22 @@ def export_units(units_path: Path, out_path: Path, seed: int) -> tuple:
         rng.shuffle(strata[key])
         queues.append(strata[key])
     rng.shuffle(queues)
-    n_tasks = n_spans = 0
+    n_tasks = n_spans = n_passage = 0
+    cache: dict = {}
     with out_path.open("w", encoding="utf-8") as out:
         for row in zip_longest(*queues):
             for u in row:
-                if u is None:
+                if u is None or (u["fragment_id"], u["part"]) in skip:
                     continue
                 meta = {k: u[k] for k in ("citation", "fragment_id", "part", "level", "era")}
                 meta.update(judgment=meta.pop("citation"), split=u["split"], signal=u["signal"])
-                t = task(u["text"], meta)
+                mentions, context = unit_mentions(u, cache)
+                t = task(u["text"], mentions, {**meta, "context": context})
                 out.write(json.dumps(t, ensure_ascii=False) + "\n")
                 n_tasks += 1
                 n_spans += len(t["spans"])
-    return len(strata), n_tasks, n_spans
+                n_passage += context == "passage"
+    return len(strata), n_tasks, n_spans, n_passage
 
 
 def main() -> int:
@@ -78,11 +117,16 @@ def main() -> int:
     parser.add_argument("--db", default=str(ROOT / "zeeker-judgements.db"))
     parser.add_argument("--units", type=Path, help="sampled units.jsonl to export instead")
     parser.add_argument("--seed", type=int, default=20261104)
+    parser.add_argument("--skip", type=Path, help="Ellf export whose answered units to leave out")
     args = parser.parse_args()
 
     if args.units:
-        n_strata, n_tasks, n_spans = export_units(args.units, args.out, args.seed)
-        print(f"{n_strata} strata, {n_tasks} tasks, {n_spans} pre-filled spans -> {args.out}")
+        skip = answered_keys(args.skip) if args.skip else set()
+        n_strata, n_tasks, n_spans, n_passage = export_units(args.units, args.out, args.seed, skip)
+        print(
+            f"{n_strata} strata, {n_tasks} tasks ({len(skip)} answered left out), "
+            f"{n_spans} pre-filled spans, {n_passage} without judgment context -> {args.out}"
+        )
         return 0
 
     db = sqlite_utils.Database(args.db)
@@ -97,27 +141,28 @@ def main() -> int:
     n_tasks = n_spans = 0
     with args.out.open("w", encoding="utf-8") as out:
         for j in judgments:
-            fragments = db.query(
-                "SELECT id, paragraph_number, content_text, footnote_text"
-                " FROM judgments_fragments WHERE judgment_id = ? ORDER BY ordinal",
-                [j["id"]],
+            fragments = list(
+                db.query(
+                    "SELECT id, paragraph_number, content_text, footnote_text"
+                    " FROM judgments_fragments WHERE judgment_id = ? ORDER BY ordinal",
+                    [j["id"]],
+                )
             )
-            for f in fragments:
-                base = {
+            paragraph = {f["id"]: f["paragraph_number"] for f in fragments}
+            for (fid, part), (text, mentions) in detect_parts(fragments).items():
+                if not text.strip():
+                    continue
+                meta = {
                     "judgment": j["citation"],
-                    "fragment_id": f["id"],
-                    "paragraph": f["paragraph_number"],
+                    "fragment_id": fid,
+                    "paragraph": paragraph[fid],
+                    "part": part,
+                    "context": "judgment",
                 }
-                parts = [("content", f["content_text"])]
-                notes = json.loads(f["footnote_text"]) if f["footnote_text"] else []
-                parts += [(f"footnote {i}", note) for i, note in enumerate(notes, 1)]
-                for part, text in parts:
-                    if not text or not text.strip():
-                        continue
-                    t = task(text, {**base, "part": part})
-                    out.write(json.dumps(t, ensure_ascii=False) + "\n")
-                    n_tasks += 1
-                    n_spans += len(t["spans"])
+                t = task(text, mentions, meta)
+                out.write(json.dumps(t, ensure_ascii=False) + "\n")
+                n_tasks += 1
+                n_spans += len(t["spans"])
 
     print(f"{len(judgments)} judgments, {n_tasks} tasks, {n_spans} pre-filled spans -> {args.out}")
     return 0
