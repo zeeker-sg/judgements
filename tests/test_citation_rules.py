@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from resources.citation_rules import detect
+from resources.citation_rules import detect, detect_judgment
 
 
 def spans(text: str, label: str | None = None):
@@ -334,3 +334,185 @@ class TestDocumentsNamedAfterProvisions:
 
     def test_section_itself_is_still_a_provision(self):
         assert only("the cautioned statement under s 23 of the CPC", "PROVISION").text == "s 23"
+
+
+class TestGoldBatchOne:
+    """Fixes from scoring the first 98 labelled gold passages (rules-4)."""
+
+    @pytest.mark.parametrize(
+        "text, citation",
+        [
+            ("Mills v Mills (1937-38) 60 CLR 150, quoted", "(1937-38) 60 CLR 150"),
+            ("reproduced in [1843-60] All ER 249 (HL)", "[1843-60] All ER 249"),
+        ],
+    )
+    def test_year_range_with_two_digit_end(self, text, citation):
+        assert only(text, "CITATION").text == citation
+
+    @pytest.mark.parametrize(
+        "text, number",
+        [
+            ("Case Number : CA 83/2002/A, Decision", "CA 83/2002/A"),
+            ("Case Number : CA 83/2002/A, Suit 755/2001/A", "Suit 755/2001/A"),
+            (
+                "who instituted Admiralty in Rem No 181 of 2009 against",
+                "Admiralty in Rem No 181 of 2009",
+            ),
+        ],
+    )
+    def test_case_numbers(self, text, number):
+        assert number in [t for _, t in spans(text, "CASE_NUMBER")]
+
+    def test_gazette_number_is_not_a_case_number(self):
+        assert spans("Rules 1963 (GN No S 98/1963) (at [41])", "CASE_NUMBER") == []
+
+    @pytest.mark.parametrize(
+        "text, name",
+        [
+            (
+                "in BTI 2014 LLC v Sequana SA and others [2022] UKSC 25 (“Sequana”)",
+                "BTI 2014 LLC v Sequana SA and others",
+            ),
+            (
+                "decision: Carl Zeiss Stiftung v Rayner & Keeler Ltd (No 2) [1967] 1 AC 853",
+                "Carl Zeiss Stiftung v Rayner & Keeler Ltd (No 2)",
+            ),
+            (
+                "Finally, Re Lim Chor Pee, ex parte Law Society of Singapore [1985-1986] SLR(R) 226",
+                "Re Lim Chor Pee, ex parte Law Society of Singapore",
+            ),
+            (
+                "argument – How Weng Fun and ors v Sengkang Town Council and other appeals [2023] SGCA 21",
+                "How Weng Fun and ors v Sengkang Town Council and other appeals",
+            ),
+            ("In The “Jian He” [1993] 3 SLR(R) 432 (“Jian He”)", "The “Jian He”"),
+            (
+                "(see Natixis, Singapore Branch v Lim Oon Kuin and others [2024] 3 SLR 1502",
+                "Natixis, Singapore Branch v Lim Oon Kuin and others",
+            ),
+        ],
+    )
+    def test_case_names_before_citation(self, text, name):
+        assert only(text, "CASE_NAME").text == name
+
+    def test_case_names_without_citation(self):
+        text = (
+            "Ms Lim attempted to distinguish McDonald’s Hamburgers Limited v Burgerking (UK) "
+            "Limited and Fraser & Neave Ltd v Yeo Hiap Seng Ltd as passing off cases. In "
+            "Fraser & Neave Ltd v Yeo Hiap Seng Ltd, the court decided"
+        )
+        assert [t for _, t in spans(text, "CASE_NAME")] == [
+            "McDonald’s Hamburgers Limited v Burgerking (UK) Limited",
+            "Fraser & Neave Ltd v Yeo Hiap Seng Ltd",
+            "Fraser & Neave Ltd v Yeo Hiap Seng Ltd",
+        ]
+
+    @pytest.mark.parametrize(
+        "text, title",
+        [
+            (
+                "under r 10 of the Advocates and Solicitors (Disciplinary Proceedings) Rules 1963 (GN",
+                "Advocates and Solicitors (Disciplinary Proceedings) Rules 1963",
+            ),
+            (
+                "that the Administration of Justice (Protection) Act 2016 (“AJPA”) exists",
+                "Administration of Justice (Protection) Act 2016",
+            ),
+        ],
+    )
+    def test_instrument_with_bracketed_word(self, text, title):
+        assert only(text, "INSTRUMENT").text == title
+
+    def test_long_title_quote_is_not_an_instrument(self):
+        assert spans("The words “An Act to provide for monogamous marriages”", "INSTRUMENT") == []
+
+    @pytest.mark.parametrize(
+        "text, provisions",
+        [
+            ("the matter. Section 93(1) of the Act provided", ["Section 93(1)"]),
+            (
+                "a laboratory test (s 70(1)(b), read with s 71(1), of the RTA).",
+                ["s 70(1)(b)", "s 71(1)"],
+            ),
+            ("under s 22. Order 89B r 2(2) of the Rules of Court", ["s 22", "Order 89B r 2(2)"]),
+            ("3-(1) Subject to subsection (2), any person", ["subsection (2)"]),
+            ("the relevant date. Subsection (5) of s 33 sets out", ["Subsection (5) of s 33"]),
+            ("for the present purposes, para (e) was germane", ["para (e)"]),
+            ("Per ss 46(1)(a) or 46(1)(b) of the GIA, these", ["ss 46(1)(a) or 46(1)(b)"]),
+        ],
+    )
+    def test_provisions(self, text, provisions):
+        assert [t for _, t in spans(text, "PROVISION")] == provisions
+
+    def test_named_statement_with_act_abbreviation(self):
+        text = "when the s 122(6) CPC statement was being taken"
+        assert spans(text, "PROVISION") == [] and spans(text, "SHORT_NAME") == []
+
+
+class TestShortNamesInJudgment:
+    """Abbreviations and short names used away from their definition."""
+
+    @pytest.mark.parametrize(
+        "text, name",
+        [
+            ("It follows that s 52 of the TCA would avail them", "TCA"),
+            ("Section 32(1) of the EA expressly contemplates", "EA"),
+            ("did not invoke section 9 of the Act to deem", "Act"),
+        ],
+    )
+    def test_abbreviation_after_provision(self, text, name):
+        assert only(text, "SHORT_NAME").text == name
+
+    def test_act_without_provision_or_definition_is_not_labelled(self):
+        assert spans("the Act was amended in 2008", "SHORT_NAME") == []
+
+    def test_supra_reference(self):
+        assert only("In Bayoil ([36] supra), the debtor did not", "SHORT_NAME").text == "Bayoil"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "on the commencement of the Arbitration (see [21] above)",
+            "conveyed informally through Ms How ([318] above)",
+        ],
+    )
+    def test_cross_reference_is_not_a_short_name(self, text):
+        assert spans(text, "SHORT_NAME") == []
+
+    def test_names_carry_across_a_judgment(self):
+        first, second = detect_judgment(
+            [
+                "the Electronic Transactions Act 2010 (“ETA”) and Goh Teck Beng v Tan "
+                "[2016] 4 SLR 977 (“Qingdao Bohai”) at [37]",
+                "Under the ETA, as Qingdao Bohai at [40] shows, the Act was",
+            ]
+        )
+        assert [(m.label, m.text, m.kind) for m in second] == [
+            ("SHORT_NAME", "ETA", "use"),
+            ("SHORT_NAME", "Qingdao Bohai", "use"),
+        ]
+
+    def test_use_never_splits_an_instrument(self):
+        first, second = detect_judgment(
+            ["s 5 of the Act applies", "the Misuse of Drugs Act 1973 (2020 Rev Ed) applies"]
+        )
+        assert [m.label for m in second] == ["INSTRUMENT"]
+
+    def test_name_defined_with_the_needs_the(self):
+        first, second = detect_judgment(
+            [
+                "O 21 r 22(2) of the Rules of Court 2021 (“the Rules”). When costs",
+                "Under the Rules, costs follow; the Supreme Court Rules differ",
+            ]
+        )
+        assert [(m.text, m.kind) for m in first if m.label == "SHORT_NAME"] == [
+            ("Rules", "defined")
+        ]
+        assert [(m.text, m.kind) for m in second if m.label == "SHORT_NAME"] == [("Rules", "use")]
+
+    def test_use_does_not_run_into_a_longer_name(self):
+        first, second = detect_judgment(["s 2 of the CYP applies", "the CYP(A)A 2019 applies"])
+        assert [m for m in second if m.label == "SHORT_NAME"] == []
+
+    def test_party_after_provision_is_not_a_short_name(self):
+        assert spans("the inquiry under s 33B(2)(b) in the PP", "SHORT_NAME") == []
