@@ -256,9 +256,12 @@ class TestGuideDecisions:
     @pytest.mark.parametrize(
         "sentence, provision",
         [
-            ("under para 4 of the First Schedule to the Act", "para 4"),
-            ("paras 4 and 5 of the Second Schedule", "paras 4 and 5"),
-            ("para 2(a) of Schedule 2", "para 2(a)"),
+            # Decision 9: the Schedule is part of the provision.
+            ("under para 4 of the First Schedule to the Act", "para 4 of the First Schedule"),
+            ("paras 4 and 5 of the Second Schedule", "paras 4 and 5 of the Second Schedule"),
+            ("para 2(a) of Schedule 2", "para 2(a) of Schedule 2"),
+            ("to accord with s 1A of the Schedule to the Act", "s 1A of the Schedule"),
+            ("salary claims (see First Schedule to the ECA)", "First Schedule"),
         ],
     )
     def test_schedule_paragraph_is_a_provision(self, sentence, provision):
@@ -534,3 +537,153 @@ class TestShortNamesInJudgment:
         ]
         text, mentions = parts[("j_0002", "content")]
         assert [(m.text, m.kind) for m in mentions] == [("EA", "use")]
+
+
+class TestGoldBatchTwo:
+    """Fixes from the second gold batch and the v3 labelling guide (rules-5)."""
+
+    @pytest.mark.parametrize(
+        "sentence, name",
+        [
+            (
+                "in 6DM (S) Pte Ltd v AE Brands Korea Ltd and others [2022] 3 SLR 1300",
+                "6DM (S) Pte Ltd v AE Brands Korea Ltd and others",
+            ),
+            (
+                "(see, eg, CIFG Special Assets Capital I Ltd (formerly known as Diamond Kendall"
+                " Ltd) v Ong Puay Koon and others [2018] 1 SLR 170)",
+                "CIFG Special Assets Capital I Ltd (formerly known as Diamond Kendall Ltd)"
+                " v Ong Puay Koon and others",
+            ),
+            (
+                "decision of Lumbers and another v W Cook Builders Pty Ltd (in liquidation)"
+                " (2008) 232 CLR 635",
+                "Lumbers and another v W Cook Builders Pty Ltd (in liquidation)",
+            ),
+            (
+                "(see Lee Tat Development Pte Ltd v Management Corporation of Strata Title"
+                " Plan No 301 [2005] 3 SLR(R) 157)",
+                "Lee Tat Development Pte Ltd v Management Corporation of Strata Title Plan No 301",
+            ),
+            (
+                "(citing Y.E.S. F&B Group Pte Ltd v Soup Restaurant Singapore Pte Ltd"
+                " [2015] 5 SLR 1187)",
+                "Y.E.S. F&B Group Pte Ltd v Soup Restaurant Singapore Pte Ltd",
+            ),
+            (
+                "Likewise, Dobbs v National Bank of Australasia Ltd (1935) 53 CLR 643 is",
+                "Dobbs v National Bank of Australasia Ltd",
+            ),
+            (
+                "In Midlink Development Pte Ltd v The Stansfield Group Pte Ltd [2004] 4 SLR(R) 258",
+                "Midlink Development Pte Ltd v The Stansfield Group Pte Ltd",
+            ),
+            (
+                "As in the Pournaras case [Hyundai Shipbuilding v Pournaras [1978] 2 Lloyd's Rep 502",
+                "Hyundai Shipbuilding v Pournaras",
+            ),
+            ("(a) In WGE v WGF [2023] SGHCF 26", "WGE v WGF"),
+            ("Ormrod LJ in Chamberlain v de la Mare (1983) 4 FLR 434", "Chamberlain v de la Mare"),
+        ],
+    )
+    def test_case_name_boundaries(self, sentence, name):
+        assert only(sentence, "CASE_NAME").text == name
+
+    def test_uncited_name_with_v_dot(self):
+        assert only("of Patten J in Perlman v. Rayden; transcript", "CASE_NAME").text == (
+            "Perlman v. Rayden"
+        )
+
+    @pytest.mark.parametrize(
+        "sentence, title",
+        [
+            (
+                "s 104 of the Indian Evidence Act (Act No 1 of 1872) (our s 106)",
+                "Indian Evidence Act (Act No 1 of 1872)",
+            ),
+            (
+                "during the Second Reading of the Road Traffic (Amendment) Act 1996 (Act 11 of 1996)",
+                "Road Traffic (Amendment) Act 1996 (Act 11 of 1996)",
+            ),
+            (
+                "under the Women’s Charter (Family Violence and Other Matters) (Amendment) Act 2023"
+                " came",
+                "Women’s Charter (Family Violence and Other Matters) (Amendment) Act 2023",
+            ),
+            (
+                "of the Constitution of the Republic of Singapore (1985 Rev Ed, 1999 Reprint).",
+                "Constitution of the Republic of Singapore (1985 Rev Ed, 1999 Reprint)",
+            ),
+            (
+                "the second reading of the Small Claims Tribunals (Amendment) Bill (Bill No 23 of 2018)",
+                "Small Claims Tribunals (Amendment) Bill (Bill No 23 of 2018)",
+            ),
+            (
+                "Claims under any Workmen's Compensation Act Cap 354 for",
+                "Workmen's Compensation Act Cap 354",
+            ),
+        ],
+    )
+    def test_instrument_titles(self, sentence, title):
+        assert only(sentence, "INSTRUMENT").text == title
+
+    def test_defined_act_name_is_a_short_name(self):
+        # Decision 17: defined, so "Penal Code" is a short name at every later use.
+        found = spans(
+            "s 302 of the Penal Code (Cap 224, 2008 Rev Ed) (“Penal Code”). Later, s 300 of the"
+            " Penal Code applies."
+        )
+        assert found == [
+            ("PROVISION", "s 302"),
+            ("INSTRUMENT", "Penal Code (Cap 224, 2008 Rev Ed)"),
+            ("SHORT_NAME", "Penal Code"),
+            ("PROVISION", "s 300"),
+            ("SHORT_NAME", "Penal Code"),
+        ]
+
+    def test_act_name_defined_away_from_its_title(self):
+        first, second = detect_judgment(
+            [
+                "the Carriage by Air (Montreal Convention, 1999) Act 2007 (the “Montreal"
+                " Convention”), on",
+                "Article 26 of the Montreal Convention",
+            ]
+        )
+        assert [m.text for m in second if m.label == "SHORT_NAME"] == ["Montreal Convention"]
+
+    def test_undefined_act_name_stays_an_instrument(self):
+        assert only("s 3 of the Penal Code could not", "INSTRUMENT").text == "Penal Code"
+
+    @pytest.mark.parametrize(
+        "sentence, name",
+        [
+            ("s 46 of the new LTA is meant", "new LTA"),
+            ("under s 60 of the old SCJA, that", "old SCJA"),
+            ("Clause in s 112(10) of the current Act; instead", "current Act"),
+        ],
+    )
+    def test_modifier_is_part_of_short_name(self, sentence, name):
+        assert only(sentence, "SHORT_NAME").text == name
+
+    def test_case_name_as_a_test_is_not_labelled(self):
+        assert spans("in preference to the long-standing Evans v Bartlam test.") == []
+
+    @pytest.mark.parametrize(
+        "sentence, provision",
+        [
+            ("shall have regard to Order 110, Rule 46(1) of the Rules", "Order 110, Rule 46(1)"),
+            ("The introduction of the new O 2 rr 1(1) and 1(2) of", "O 2 rr 1(1) and 1(2)"),
+            ("in accordance with regulation 17(2) of the", "regulation 17(2)"),
+            ("brought my attention to Order 89 of the Rules", "Order 89"),
+            ("constitute power under O 24 ROC", "O 24"),
+        ],
+    )
+    def test_rules_of_court_and_regulations(self, sentence, provision):
+        assert spans(sentence, "PROVISION")[0][1] == provision
+
+    def test_rules_year_is_not_a_provision(self):
+        assert spans("Under the Family Justice Rules 2014, the", "PROVISION") == []
+
+    @pytest.mark.parametrize("number", ["DAC 921470/2021", "HC/MA 9089/2025/01"])
+    def test_longer_case_numbers(self, number):
+        assert only(f"In {number}, the Appellant", "CASE_NUMBER").text == number

@@ -15,13 +15,17 @@ Labels follow Blackstone's scheme, adapted (it spells ``CASENAME``):
 - ``CASE_NUMBER`` a court file number, ``CA/CCA 20/2022``, ``Suit No 123 of 2019``
 - ``CASE_NAME``   a case name written out in full, with or without a citation
 - ``SHORT_NAME``  a name defined in brackets right after a citation or Act,
-                  ``(“KS v LHY”)`` (the span is the quoted name only), a
-                  supra reference (``Bayoil ([36] supra)``), an Act
-                  abbreviation or "Act" after a provision (``s 52 of the TCA``),
-                  and every later use of a name defined earlier
-- ``INSTRUMENT``  an Act, Code, Charter, Rules or Regulations title
+                  ``(“KS v LHY”)`` (the span is the quoted name only), an
+                  Act's name defined anywhere (``(“Penal Code”)``), a supra
+                  reference (``Bayoil ([36] supra)``), an Act abbreviation or
+                  "Act" after a provision (``s 52 of the TCA``), and every
+                  later use of a name defined earlier, with a word or year in
+                  front (``new LTA``, ``2019 RTA``)
+- ``INSTRUMENT``  an Act, Bill, Code, Charter, Rules or Regulations title, with
+                  its year, edition and number
 - ``PROVISION``   a section, rule, order or article reference, ``s 52(14)``,
-                  or a paragraph of a Schedule (``para 4`` of the First Schedule)
+                  a Schedule, or a provision of one (``para 4 of the First
+                  Schedule``)
 
 The edge cases are settled in the design doc's "Labelling guide" tab.
 
@@ -36,7 +40,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Set
 
-DETECTOR_VERSION = "rules-4"
+DETECTOR_VERSION = "rules-5"
 
 # ---------------------------------------------------------------------------
 # Citations: [year] vol ABBR page, one pattern for neutral and reported forms
@@ -68,7 +72,9 @@ JOURNAL_ABBR_RE = re.compile(
 CASE_NUMBER_RE = re.compile(
     r"(?<![\w/])(?P<num>"
     # An old file number may end in a letter: "CA 83/2002/A", "Suit 755/2001/A".
-    r"(?:[A-Z]{2,4}/)?(?:[A-Z]{1,6}|Suit)\s\d{1,5}/\d{4}(?:/[A-Z])?(?![\w/])"
+    # A State Courts charge has 6 digits ("DAC 921470/2021"); an appeal from
+    # one adds "/01" ("HC/MA 9089/2025/01").
+    r"(?:[A-Z]{2,4}/)?(?:[A-Z]{1,6}|Suit)\s\d{1,6}/\d{4}(?:/(?:[A-Z]|\d{2}))?(?![\w/])"
     # "Admiralty in Rem No 181 of 2009" keeps its lower-case "in".
     r"|(?:[A-Z][\w’']*\s+(?:in\s+(?=Rem\b|Personam\b))?){1,4}No\.?\s*\d{1,5}\s+of\s+\d{4}(?!\d)"
     r")"
@@ -88,9 +94,21 @@ SG_REPORT_ABBR_RE = re.compile(r"^SLR(?:\s?\(R\))?$")
 _PINPOINT = r"at\s*\[[^\]]{1,12}\](?:\s*(?:–|-|to|and|,)\s*\[[^\]]{1,12}\])*"
 PINPOINT_RE = re.compile(r"\s*(?P<pin>" + _PINPOINT + r")")
 
-# A defined name in brackets: (“KS v LHY”), (the “Default Judgment”).
+# A defined name in brackets: (“KS v LHY”), (the “Default Judgment”). A ’
+# inside a word ("Women’s Charter") does not close the name.
 DEFINITION_RE = re.compile(
-    r"\s*\(\s*(?:the\s+|hereafter\s+|hereinafter\s+)?[“\"‘](?P<name>[^”\"’]{1,80})[”\"’]\s*\)"
+    r"\s*\(\s*(?:the\s+|hereafter\s+|hereinafter\s+)?[“\"‘]"
+    r"(?P<name>(?:[^”\"’]|’(?=\w)){1,80})[”\"’]\s*\)"
+)
+
+# Decision 18: a word or year in front of a short name is part of it
+# ("the new LTA", "the old SCJA", "the 2019 RTA").
+_MODIFIER = r"(?:new|old|current|amended|repealed|former|present|previous|\d{4})"
+
+# Decision 20: a case name used as the name of a test is not labelled
+# ("the Saudi Eagle test", "the Evans v Bartlam test").
+TEST_AFTER_RE = re.compile(
+    r"\s+(?:test|doctrine|principle|approach|framework|formulation|threshold)s?\b"
 )
 
 # A supra reference names a case cited earlier: "Bayoil ([36] supra)",
@@ -114,6 +132,7 @@ CASE_NAME_CONNECTORS = {
     "(alias", "&", "matter", "matters", "appeal", "appeals", "suit", "suits",
     "application", "applications", "re", "ex", "parte", "for", "on", "behalf", "an",
     "a", "trading", "as", "nee", "formerly", "deceased", "estate", "other",
+    "la", "le", "du", "di", "da", "del", "des", "bankrupt", "decd", "v.",
 }  # fmt: skip
 
 # Connectors that can also open a name ("de Dampierre v de Dampierre").
@@ -126,12 +145,28 @@ CASE_NAME_LEAD_STOP = {
     "However", "Moreover", "Indeed", "Accordingly", "Therefore", "Again", "Here",
     "First", "Second", "Third", "Lastly", "Notably", "Nevertheless", "Conversely",
     "Distinguishing", "Citing", "Contrast", "Compare", "Both", "Neither", "Either",
+    "Likewise", "Instead", "Recently", "Earlier", "Later", "Since", "Although",
 }  # fmt: skip
+
+# A bracketed phrase inside a party's name: "(formerly known as …)", "(in
+# liquidation)", "(administrator of the estate of …, deceased)", "(S)", "(Aust.)".
+_NAME_BRACKET_RE = re.compile(
+    r"\((?:(?:formerly|in|administrator|administratrix|executor|executrix|trading|suing|sued"
+    r"|as|by|a|an|previously|now|f\.?k\.?a\.?)\b[^()\[\];]{0,160}|[A-Z][A-Za-z.]{0,5})\)"
+)
+# Tokens with a full stop that sit inside a name: initials ("Y.E.S.", "C.M."),
+# company words ("Pty.", "Ltd.", "Co.") and "v.".
+_DOTTED_NAME_TOKEN_RE = re.compile(
+    r"\(?(?:[A-Z]\.){1,5}[A-Z]?\.?,?|\(?(?:Co|Ltd|Inc|Bhd|Corp|No|St|Pty|Aust|Bros|Mfg|Plc|Pte"
+    r"|Ltda|Assn|Intl)\.\)?,?|v\."
+)
 
 # "(No 2)" ends a case name: "Carl Zeiss Stiftung v Rayner & Keeler Ltd (No 2)".
 _NUMBER_SUFFIX_RE = re.compile(r"\s*\(No\.?\s*\d+\)$")
 # A ship's name stands for an admiralty case: The “Jian He”, The Playa Larga.
-SHIP_NAME_RE = re.compile(r"(?<![\w’'])The\s+[“\"]?[A-Z][\w’'-]*(?:\s+[A-Z][\w’'-]*){0,3}[”\"]?$")
+SHIP_NAME_RE = re.compile(
+    r"(?<![\w’'])The\s+[“\"]?[A-Z][\w’'-]*(?:\s+[A-Z0-9][\w’'-]*){0,3}[”\"]?$"
+)
 
 _TOKEN_RE = re.compile(r"\S+")
 # "Ms How ([318] above)" points back at a person, not a case.
@@ -158,18 +193,33 @@ def _case_name_before(text: str, end: int, ships: bool = True) -> Optional[tuple
     tokens = list(_TOKEN_RE.finditer(window))
     kept: List[re.Match] = []
     seen_v = False
-    for i in range(len(tokens) - 1, -1, -1):
+    i = len(tokens)
+    while i > 0:
+        i -= 1
         tok = tokens[i]
         word = tok.group(0)
+        # A bracketed phrase inside a name is taken whole: "(in liquidation)".
+        if word.endswith(")") and "(" not in word:
+            j = next((k for k in range(i - 1, max(-1, i - 25), -1)
+                      if tokens[k].group(0).startswith("(")), None)  # fmt: skip
+            if j is not None and _NAME_BRACKET_RE.fullmatch(window, tokens[j].start(), tok.end()):
+                kept.extend(reversed(tokens[j : i + 1]))
+                i = j
+                continue
+        if word.startswith("[") and len(word) > 1 and word[1].isupper() and "]" not in word:
+            # "[Hyundai Shipbuilding v Pournaras [1978] …": the name opens here.
+            kept.append(tok)
+            break
         if any(ch in word for ch in ";:[]") or word.endswith("."):
-            # "Ltd." or "Co." could be in a name; ". " usually ends a sentence.
-            if not re.fullmatch(r"(?:Co|Ltd|Inc|Bhd|Corp|No|St)\.,?", word):
+            # "Ltd.", "Pty." or "Y.E.S." can be in a name; ". " usually ends a
+            # sentence.
+            if not _DOTTED_NAME_TOKEN_RE.fullmatch(word):
                 break
         bare = word.strip('(),“”"')
         # A closing definition, (“ETA”), ends the clause before the name.
         if not bare or word.endswith(("”)", '")', "’)")):
             break
-        if word == "v":
+        if word in ("v", "v."):
             if seen_v:
                 # A second name: cut at the "and" that joins the two.
                 ands = [k for k, t in enumerate(kept) if t.group(0) == "and"]
@@ -177,7 +227,8 @@ def _case_name_before(text: str, end: int, ships: bool = True) -> Optional[tuple
                 break
             seen_v = True
         if bare[0].isdigit():
-            # "BTI 2014 LLC": a number between two capitalised words.
+            # "BTI 2014 LLC": a number between two capitalised words; "6DM",
+            # a name that opens with a digit; "Plan No 301", a numbered name.
             inside = (
                 word.isalnum()
                 and kept
@@ -185,7 +236,9 @@ def _case_name_before(text: str, end: int, ships: bool = True) -> Optional[tuple
                 and i > 0
                 and tokens[i - 1].group(0)[0].isupper()
             )
-            if not inside:
+            numbered = i > 0 and tokens[i - 1].group(0) in ("No", "No.") and bare.isdigit()
+            lettered = bool(re.fullmatch(r"\d+[A-Z][A-Za-z]*", bare)) and bool(kept)
+            if not (inside or numbered or lettered):
                 break
             kept.append(tok)
             continue
@@ -194,13 +247,17 @@ def _case_name_before(text: str, end: int, ships: bool = True) -> Optional[tuple
             continue
         break
     kept.reverse()
-    if ships:
+    if ships and not seen_v:
         ship = SHIP_NAME_RE.search(window)
         if ship and " v " not in ship.group(0):
             return window_start + ship.start(), window_start + ship.end()
     # Trim leading clause openers and connectors.
     while kept:
-        first = kept[0].group(0).strip('(“",')
+        first = kept[0].group(0).strip('(“",[')
+        # A list marker: "(a) In WGE v WGF".
+        if len(kept) > 1 and re.fullmatch(r"\(\w{1,4}\)", kept[0].group(0)):
+            kept.pop(0)
+            continue
         if first in ("In", "Ex") and len(kept) > 1:
             nxt = kept[1].group(0)
             if (first, nxt) in (("In", "re"), ("Ex", "parte")):
@@ -213,7 +270,7 @@ def _case_name_before(text: str, end: int, ships: bool = True) -> Optional[tuple
         break
     if not kept:
         return None
-    words = [t.group(0) for t in kept]
+    words = ["v" if t.group(0) == "v." else t.group(0) for t in kept]
     opens_re = words[0] in ("Re", "In", "Ex") and (
         words[0] == "Re" or (len(words) > 1 and words[1] in ("re", "parte"))
     )
@@ -223,7 +280,7 @@ def _case_name_before(text: str, end: int, ships: bool = True) -> Optional[tuple
     stop = window_start + kept[-1].end()
     # A case name never starts with an opening bracket or quote, nor ends
     # with a comma.
-    while start < stop and text[start] in '(“"':
+    while start < stop and text[start] in '(“"[':
         start += 1
     while stop > start and text[stop - 1] in ",":
         stop -= 1
@@ -242,14 +299,15 @@ def _case_name_around(text: str, v_pos: int) -> Optional[tuple]:
     up to a lower-case word, clause punctuation or another `` v ``), then
     back over the first party with ``_case_name_before``.
     """
-    after = list(_TOKEN_RE.finditer(text, v_pos + 2, min(len(text), v_pos + 2 + _NAME_WINDOW)))
+    v_end = v_pos + (3 if text.startswith("v.", v_pos) else 2)
+    after = list(_TOKEN_RE.finditer(text, v_end, min(len(text), v_end + _NAME_WINDOW)))
     if not after or not after[0].group(0).lstrip('(“"')[:1].isupper():
         return None
     stop = None
     for k, tok in enumerate(after):
         word = tok.group(0)
         bare = word.strip('(),“”"’')
-        if word == "v":
+        if word in ("v", "v."):
             # Two names in a row: this one ends before the "and" joining them.
             ands = [j for j in range(k) if after[j].group(0) == "and"]
             stop = after[ands[-1] - 1] if ands and ands[-1] > 0 else None
@@ -298,21 +356,44 @@ def _case_name_around(text: str, v_pos: int) -> Optional[tuple]:
 # ---------------------------------------------------------------------------
 
 _STATUTE_KEYWORD = (
-    r"(?:Act|Code|Charter|Ordinance|Rules|Regulations|Constitution|Treaty|Convention|Protocol)"
+    r"(?:Act|Bill|Code|Charter|Ordinance|Rules|Regulations|Constitution|Treaty|Convention"
+    r"|Protocol)"
 )
+# A defined name that names an Act (decision 17): "Penal Code", "SIAC Rules".
+ACT_NAME_RE = re.compile(rf"\b(?:{_STATUTE_KEYWORD}|Law)\b")
 INSTRUMENT_RE = re.compile(
     # The lookbehind stops a title starting inside "s 11A of the …".
     r"(?<![\w’'])(?P<title>"
     r"(?:[A-Z][\w’'-]*\s+)"
     # A bracketed word can sit inside: "Administration of Justice (Protection) Act".
-    r"(?:(?:\(?[A-Z][\w’'()-]*|of|and|the|for|in|on|to|&)\s+){0,10}?"
+    r"(?:(?:\(?[A-Z][\w’'()-]*|of|and|the|for|in|on|to|by|&)\s+){0,10}?"
     # A second keyword continues the title: "Energy Charter Treaty".
     rf"{_STATUTE_KEYWORD}(?:\s+{_STATUTE_KEYWORD})?\b"
     r"(?:\s+of\s+(?:the\s+)?[A-Z][\w’']*(?:\s+(?:of\s+)?[A-Z][\w’']*)*)?"
     r"|Rules\s+of\s+Court"
+    # A title can open with its keyword: "Constitution of the Republic of Singapore".
+    r"|(?:Constitution|Charter|Convention|Treaty|Rules)\s+of\s+(?:the\s+)?[A-Z][\w’']*"
+    r"(?:\s+(?:of\s+)?[A-Z][\w’']*)*"
     r")"
+)
+# A title goes on past a keyword through bracketed words to another keyword:
+# "Women’s Charter (Family Violence and Other Matters) (Amendment) Act",
+# "Carriage by Air (Montreal Convention, 1999) Act".
+_TITLE_END_KEYWORD = r"\s+(?:Act|Bill|Rules|Regulations|Code|Order)\b"
+TITLE_GOES_ON_RE = re.compile(r"(?:\s+\([^()]{1,60}\))+" + _TITLE_END_KEYWORD)
+TITLE_BRACKET_CLOSES_RE = re.compile(r"[^()]{0,30}\)(?:\s+\([^()]{1,60}\))*" + _TITLE_END_KEYWORD)
+# Year, edition and number after a title: "1996 (Act 11 of 1996)",
+# "(Cap 224, 2008 Rev Ed)", "(1985 Rev Ed, 1999 Reprint)", "Cap 354".
+INSTRUMENT_TAIL_RE = re.compile(
     r"(?:\s+(?P<year>\d{4}))?"
-    r"(?:\s*\((?P<edition>(?:Cap\s*[\w.]+,\s*)?(?:R\s*\d+,\s*)?\d{4}\s+Rev\s+Ed|Cap\s*[\w.]+)\))?"
+    r"(?:\s*\((?P<edition>(?:Cap\s*[\w.]+,\s*)?(?:R\s*\d+,\s*)?\d{4}\s+Rev\s+Ed"
+    r"(?:,\s*\d{4}\s+Reprint)?|Cap\s*[\w.]+|UK|Cth|NSW|India)\)|\s+(?P<cap>Cap\s*\d+[A-Z]?)\b)?"
+    r"(?:\s*\((?P<number>(?:Act|Bill)\s+(?:No\.?\s*)?\d+\s+of\s+\d{4})\))?"
+)
+# "Second Reading of the Road Traffic (Amendment) Act 1996": the debate is
+# not part of the title.
+READING_PREFIX_RE = re.compile(
+    r"(?:(?:First|Second|Third)\s+Reading|Opening\s+Speech)\s+of\s+(?:the\s+)?"
 )
 # Capitalised function words that open a clause before a statute title.
 INSTRUMENT_LEAD_STOP = {
@@ -337,7 +418,7 @@ PROVISION_RE = re.compile(
     # Not after an apostrophe: "Respondent’s 25%" is a possessive, not s 25.
     r"(?<![\w’'])(?P<prov>"
     # A paragraph of a Schedule: "para 4 of the First Schedule"
-    r"paras?\s*\d+[A-Z]*(?:\(\w{1,5}\))*"
+    r"(?:[Pp]ara(?:graph)?s?)\s*\d+[A-Z]*(?:\(\w{1,5}\))*"
     r"(?:(?:\s+and\s+|,\s*|\s*[–-]\s*)\d+[A-Z]*(?:\(\w{1,5}\))*)*"
     r"(?=\s+(?:of|to|in)\s+(?:the\s+)?(?:\w+\s+)?Schedule\b)"
     # A paragraph or subsection of a provision: "para (e)", "subsection (2)",
@@ -345,11 +426,21 @@ PROVISION_RE = re.compile(
     rf"|(?:[Pp]ara(?:graph)?s?|[Ss]ub-?sections?|subss?)\s*{_SUBNUM}"
     rf"(?:{_LIST_JOIN}{_SUBNUM})*"
     rf"(?:\s+of\s+(?:s|section)\s*{_NUM})?"
-    # Rules of Court: O 3 r 2(8), Order 89B r 2(2)
-    r"|(?:O|Order)\s*\d+[A-Z]?\s+rr?\s*\d+[A-Z]*(?:\(\w{1,5}\))*"
-    rf"|(?:ss?|[Ss]ections?|regs?|rr?|Arts?|arts?|Articles?)\s*{_NUM}"
+    # Rules of Court: O 3 r 2(8), Order 89B r 2(2), O 2 rr 1(1) and 1(2),
+    # Order 110, Rule 46(1), and a whole Order: O 24, Order 89
+    rf"|(?:O|Order)\s*(?!(?:19|20)\d\d\b)\d+[A-Z]?(?:,?\s+(?:rr?|[Rr]ules?)\s*{_NUM}(?:{_LIST_JOIN}{_NUM})*)?"
+    rf"|(?:ss?|[Ss]ections?|regs?|[Rr]egulations?|rr?|Arts?|arts?|Articles?)\s*{_NUM}"
     rf"(?:{_LIST_JOIN}(?:{_NUM}|{_SUBNUM}))*"
+    # "Rules 1 and 2 of that Order", but not the year in "Family Justice Rules 2014"
+    rf"|Rules?\s+(?!(?:19|20)\d\d\b){_NUM}(?:{_LIST_JOIN}{_NUM})*"
+    # Decision 9: a Schedule on its own, "First Schedule", "Schedule 2"
+    r"|(?:(?:First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh"
+    r"|Twelfth)\s+Schedule|Schedule\s+\d+[A-Z]?)"
     r")(?![\w%])"
+    # Decision 9: "of the Schedule" belongs to the provision: "s 1A of the
+    # Schedule", "para 1 of the Second Schedule".
+    r"(?:\s+(?:of|to|in)\s+(?:the\s+(?:(?:First|Second|Third|Fourth|Fifth|Sixth|Seventh"
+    r"|Eighth|Ninth|Tenth|Eleventh|Twelfth)\s+)?Schedule\b(?!\s+\d)|Schedule\s+\d+[A-Z]?\b))?"
 )
 
 # Decision 14: a contract is not an instrument, so "Art 26.1 of the Contract"
@@ -370,7 +461,8 @@ NAMED_DOCUMENT_AFTER_RE = re.compile(r"\s+(?:[A-Z]{2,6}\s+)?statements?\b")
 # definition is out of sight: "s 52 of the TCA". So is "the Act" standing
 # for one Act (decision 16); the span is "Act" alone.
 ABBR_AFTER_PROVISION_RE = re.compile(
-    r"\s+of\s+(?:(?P<the>the)\s+)?(?P<abbr>[A-Z][A-Z0-9]{1,7}|Act|Code)\b"
+    rf"\s+of\s+(?:(?P<the>the)\s+)?(?:(?P<mod>{_MODIFIER})\s+)?"
+    r"(?P<abbr>[A-Z][A-Z0-9]{1,7}|Act|Code)\b"
     r"(?![ \t]+(?:[A-Z(]|\d))(?!\s*\(\s*(?:Cap|\d))"
 )
 
@@ -503,15 +595,21 @@ def _uses(text: str, names: Iterable[str]) -> List[Mention]:
         bare = name[4:] if with_the else name
         if len(bare) < 2 or not any(ch.isupper() for ch in bare):
             continue
-        pattern = r"(?<![\w’'])" + (r"[Tt]he\s+" if with_the else "") + re.escape(bare)
+        pattern = (
+            r"(?<![\w’'])"
+            + (r"[Tt]he\s+" if with_the else "")
+            + rf"(?:(?P<mod>{_MODIFIER})\s+)?"
+            + re.escape(bare)
+        )
         for m in re.finditer(pattern + r"(?![\w(])", text):
             after = text[m.end() :]
             if NAMED_DOCUMENT_AFTER_RE.match(after) or (
                 with_the and re.match(r"[ \t]+(?:[A-Z(]|\d)", after)
             ):
                 continue
-            start = m.end() - len(bare)
-            found.append(Mention(start, m.end(), "SHORT_NAME", bare, kind="use"))
+            # Decision 18: "the new LTA" is labelled "new LTA".
+            start = m.start("mod") if m.group("mod") else m.end() - len(bare)
+            found.append(Mention(start, m.end(), "SHORT_NAME", text[start : m.end()], kind="use"))
     return found
 
 
@@ -560,7 +658,7 @@ def detect(text: str, known: Optional[Iterable[str]] = None) -> List[Mention]:
             )
 
     # Decision 10: a case name written out in full, with no citation after it.
-    for vm in re.finditer(r"(?<=\s)v(?=\s)", text):
+    for vm in re.finditer(r"(?<=\s)v\.?(?=\s)", text):
         name = _case_name_around(text, vm.start())
         if name:
             found.append(
@@ -612,18 +710,30 @@ def detect(text: str, known: Optional[Iterable[str]] = None) -> List[Mention]:
         start = m.start("title") + tokens[0].start()
         # "First Schedule of the Stamp Duties Act": the Schedule is a part of
         # the Act, not part of its title.
-        part = SCHEDULE_PREFIX_RE.match(text, start, m.end("title"))
-        if part:
-            start = part.end()
-            tokens = list(_TOKEN_RE.finditer(text[start : m.end("title")]))
-        title = text[start : m.end("title")]
+        title_end = m.end("title")
+        for prefix in (SCHEDULE_PREFIX_RE, READING_PREFIX_RE):
+            part = prefix.match(text, start, title_end)
+            if part:
+                start = part.end()
+                tokens = list(_TOKEN_RE.finditer(text[start:title_end]))
+        while True:
+            unclosed = text.count("(", start, title_end) > text.count(")", start, title_end)
+            more = (TITLE_BRACKET_CLOSES_RE if unclosed else TITLE_GOES_ON_RE).match(
+                text, title_end
+            )
+            if not more:
+                break
+            title_end = more.end()
+        title = text[start:title_end]
         if (
             not tokens
             or title in _INSTRUMENT_TOO_GENERIC
             or any(t.group(0) in _INSTRUMENT_NOT_TITLE_WORDS for t in tokens)
         ):
             continue
-        end = m.end()
+        tail = INSTRUMENT_TAIL_RE.match(text, title_end)
+        end = tail.end()
+        edition = tail.group("edition") or tail.group("cap")
         found.append(
             Mention(
                 start,
@@ -634,12 +744,18 @@ def detect(text: str, known: Optional[Iterable[str]] = None) -> List[Mention]:
                     p
                     for p in (
                         title,
-                        m.group("year"),
-                        m.group("edition") and f"({m.group('edition')})",
+                        tail.group("year"),
+                        edition and f"({edition})",
+                        tail.group("number") and f"({tail.group('number')})",
                     )
                     if p
                 ),
-                meta={"title": title, "year": m.group("year"), "edition": m.group("edition")},
+                meta={
+                    "title": title,
+                    "year": tail.group("year"),
+                    "edition": edition,
+                    "number": tail.group("number"),
+                },
             )
         )
         definition = DEFINITION_RE.match(text, end)
@@ -655,26 +771,67 @@ def detect(text: str, known: Optional[Iterable[str]] = None) -> List[Mention]:
             )
 
     for m in PROVISION_RE.finditer(text):
-        end = m.end("prov")
+        end = m.end()
         if CONTRACT_AFTER_RE.match(text, end) or NAMED_DOCUMENT_AFTER_RE.match(text, end):
+            continue
+        # "Rule 5", "Order 2" or "Schedule 3" after a capitalised word is part
+        # of a title or a name ("Family Justice Rule 5", "Transfer Order 2").
+        if re.match(r"(?:Rules?|Order|Schedule)\s", m.group("prov")) and re.search(
+            r"(?<![\w’'])[A-Z][\w’'-]*\s+$", text[max(0, m.start() - 30) : m.start()]
+        ):
             continue
         found.append(
             Mention(
                 m.start("prov"),
-                m.end("prov"),
+                end,
                 "PROVISION",
-                m.group("prov"),
-                normalised=re.sub(r"\s+", " ", m.group("prov")),
+                text[m.start("prov") : end],
+                normalised=re.sub(r"\s+", " ", text[m.start("prov") : end]),
             )
         )
         abbr = ABBR_AFTER_PROVISION_RE.match(text, end)
         if abbr and (abbr.group("abbr") not in ("Act", "Code") or abbr.group("the")):
             generic = abbr.group("abbr") in ("Act", "Code")
-            start = abbr.start("the") if generic else abbr.start("abbr")
-            found.append(_short_name(text, start, abbr.end("abbr"), "after_provision"))
+            if generic:
+                start = abbr.start("the")
+            else:
+                start = abbr.start("mod") if abbr.group("mod") else abbr.start("abbr")
+            short = _short_name(text, start, abbr.end("abbr"), "after_provision")
+            # A later use is the name without its modifier: "the Act", "SCJA".
+            short.meta["name"] = ("the " if generic else "") + abbr.group("abbr")
+            found.append(short)
+
+    # Decision 17: an Act's name defined in brackets is a short name wherever the
+    # definition sits ("… 1999) Act 2007 (the “Montreal Convention”)").
+    for d in DEFINITION_RE.finditer(text):
+        name = d.group("name").strip()
+        if ACT_NAME_RE.search(name) and name[0].isupper() and name not in _INSTRUMENT_TOO_GENERIC:
+            found.append(_short_name(text, d.start("name"), d.end("name"), "defined"))
 
     names = set(known or ()) | defined_names(found)
-    found += _uses(text, names)
+    uses = _uses(text, names)
+    use_spans = {(u.start, u.end) for u in uses}
+    found = [
+        m
+        for m in found
+        # A defined Act name is a short name, not a title (decision 17), and a
+        # case name defined earlier is a use of its short name.
+        if not (
+            (m.start, m.end) in use_spans
+            and (
+                (m.label == "INSTRUMENT" and not (m.meta.get("year") or m.meta.get("edition")))
+                or m.kind == "uncited"
+            )
+        )
+    ]
+    found += uses
+    found = [
+        m
+        for m in found
+        if not (
+            (m.kind == "uncited" or m.label == "SHORT_NAME") and TEST_AFTER_RE.match(text, m.end)
+        )
+    ]
     return _resolve_overlaps(found)
 
 
