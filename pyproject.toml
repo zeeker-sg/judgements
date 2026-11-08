@@ -16,7 +16,7 @@ dependencies = [
 
 # Optional: Add zeeker-common for shared utilities (Jina Reader, OpenAI, etc.)
 # dependencies = [
-#     "zeeker>=0.6.0",
+#     "zeeker>=0.9.0",
 #     "zeeker-common>=0.1.0",
 # ]
 
@@ -25,7 +25,7 @@ dev = ["black>=25.1.0", "ruff>=0.8.0", "pytest>=8.0.0"]
 
 # Add project-specific dependencies here as needed:
 # dependencies = [
-#     "zeeker>=0.6.0",
+#     "zeeker>=0.9.0",
 #     "zeeker-common>=0.1.0",  # For get_hash_id, get_jina_reader_content, etc.
 #     "requests>=2.31.0",      # For HTTP API calls
 #     "beautifulsoup4>=4.12.0", # For web scraping and HTML parsing
