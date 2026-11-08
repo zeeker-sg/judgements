@@ -18,6 +18,14 @@ Writes ``.cache/gold_sample/units.jsonl``, one unit per line, each with its
 stratum, split and whether it carried the loose signal. Re-running reuses
 the catalogue and fetched HTML; ``--seed`` makes the draw repeatable.
 
+A held-out linker set (2026-11-07) is drawn with ``--cases-only`` (only
+units that carry an SLR or neutral case citation), ``--exclude`` (skip
+every judgment in an earlier units file) and ``--out`` (a separate file):
+
+  uv run python scripts/sample_gold_fragments.py --cases-only --tune-share 0 \\
+      --exclude .cache/gold_sample/units.jsonl \\
+      --out .cache/gold_sample/heldout/units.jsonl --seed 20261107
+
 Run:  uv run python scripts/sample_gold_fragments.py [--judgments 200]
 """
 
@@ -91,6 +99,8 @@ BODY_CLASS_RE = re.compile(r"^Judg-(?:1|1-firstpara|2|3|4|Quote.*|List.*)$")
 SIGNAL_RE = re.compile(
     r"[\[(]\d{4}[\])]|\s v\s|\bss?\s?\d|\b(?:Act|Code|Rules|Regulations)\b|\b[A-Z]{2,}\s?\d+/\d{4}"
 )
+# A Singapore case citation: an SLR / SLR(R) report or a neutral citation.
+CASE_RE = re.compile(r"\[\d{4}\]\s*(?:\d+\s+SLR(?:\s*\(R\))?\s+\d|SG[A-Z]+\s+\d)")
 
 
 def load_catalogue() -> list[dict]:
@@ -170,14 +180,31 @@ def main() -> int:
     parser.add_argument("--min-footnote", type=int, default=40)
     parser.add_argument("--tune-share", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=20261104)
+    parser.add_argument("--out", type=Path, default=OUT_DIR / "units.jsonl")
+    parser.add_argument(
+        "--exclude",
+        type=Path,
+        action="append",
+        default=[],
+        help="units.jsonl whose judgments to leave out (repeatable)",
+    )
+    parser.add_argument(
+        "--cases-only",
+        action="store_true",
+        help="pick only units with an SLR or neutral case citation",
+    )
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
     catalogue = load_catalogue()
+    excluded = {json.loads(line)["judgment_id"] for path in args.exclude for line in path.open()}
+    if excluded:
+        catalogue = [r for r in catalogue if make_id(r["source_url"] or "") not in excluded]
     sample = draw(catalogue, args.judgments, rng)
-    print(f"catalogue {len(catalogue)} judgments; drew {len(sample)}")
+    print(f"catalogue {len(catalogue)} judgments ({len(excluded)} excluded); drew {len(sample)}")
 
-    out_path = OUT_DIR / "units.jsonl"
+    out_path = args.out
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     n_units = n_signal = n_skipped = 0
     with create_client() as client, out_path.open("w", encoding="utf-8") as out:
         for k, row in enumerate(sample, 1):
@@ -192,6 +219,11 @@ def main() -> int:
                 n_skipped += 1
                 continue
             units = units_of(extracted, args.min_chars, args.min_footnote)
+            if args.cases_only:
+                units = [u for u in units if CASE_RE.search(u["text"])]
+                if not units:
+                    n_skipped += 1
+                    continue
             signal = [u for u in units if SIGNAL_RE.search(u["text"])]
             plain = [u for u in units if not SIGNAL_RE.search(u["text"])]
             n_signal_pick = min(len(signal), round(args.per_judgment * 0.6 + 0.4))
