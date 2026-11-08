@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 
 [[package]]
@@ -99,11 +99,11 @@ wheels = [
 
 [[package]]
 name = "certifi"
-version = "2026.2.25"
+version = "2026.10.19"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/af/2d/7bf41579a8986e348fa033a31cdd0e4121114f6bce2457e8876010b092dd/certifi-2026.2.25.tar.gz", hash = "sha256:e887ab5cee78ea814d3472169153c2d12cd43b14bd03329a39a9c6e2e80bfba7", size = 155029, upload-time = "2026-02-25T02:54:17.342Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a6/bd/1436c50cc46699de0230fbaacc1d1de7bfec413176099949e9d5112e88f2/certifi-2026.10.19.tar.gz", hash = "sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae", size = 137598, upload-time = "2026-10-20T02:24:16.604Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9a/3c/c17fb3ca2d9c3acff52e30b309f538586f9f5b9c9cf454f3845fc9af4881/certifi-2026.2.25-py3-none-any.whl", hash = "sha256:027692e4402ad994f1c42e52a4997a9763c646b73e4096e4d5d6db8af1d6f0fa", size = 153684, upload-time = "2026-02-25T02:54:15.766Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/51/29046e48f693c54e5b7412216d447a1d8362c9653148d98c02cdf65fa733/certifi-2026.10.19-py3-none-any.whl", hash = "sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b", size = 136464, upload-time = "2026-10-20T02:24:15.072Z" },
 ]
 
 [[package]]
@@ -910,7 +910,7 @@ wheels = [
 
 [[package]]
 name = "zeeker"
-version = "0.7.0"
+version = "0.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -921,9 +921,9 @@ dependencies = [
     { name = "rich" },
     { name = "sqlite-utils" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5b/5d/758b49d187fc9ff159d429fb9ba7289f629722141c91dce55abe59b110f0/zeeker-0.7.0.tar.gz", hash = "sha256:8faaa5cdada0bfdf891d40aa5221f1f583fbe238ffab3de5e1210621908467b4", size = 95700, upload-time = "2026-04-17T12:36:16.674Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c1/29/48e82299a5a467db1b1cc29bd9d62aab30ad91f626a84ed9d14de95048df/zeeker-0.9.0.tar.gz", hash = "sha256:134130eb09bf6f8c9b4d1a1d0094a3f6c0ea2312866c1832bd376fcf73552978", size = 120003, upload-time = "2026-07-16T15:47:46.981Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/74/b12926773a18a6ae3fd1c62e17c2a131b11c05c56157275a3b9a92c50495/zeeker-0.7.0-py3-none-any.whl", hash = "sha256:5eebb9cb2d36a068326204c8b4e1778b2f471e0e917c5301a6abd87efb73e62b", size = 72712, upload-time = "2026-04-17T12:36:17.864Z" },
+    { url = "https://files.pythonhosted.org/packages/78/5b/b72f932b942a1873880460bcf29c488d3ee3e35f787992bb891da552063d/zeeker-0.9.0-py3-none-any.whl", hash = "sha256:c4eff18433fcc721ae75de2f5bf18500288a7d138512c4437db7fba676911bc3", size = 86037, upload-time = "2026-07-16T15:47:45.983Z" },
 ]
 
 [[package]]
@@ -955,7 +955,7 @@ requires-dist = [
     { name = "lxml", specifier = ">=6.0.4" },
     { name = "openai", specifier = ">=1.50" },
     { name = "tenacity", specifier = ">=9.1.4" },
-    { name = "zeeker", specifier = ">=0.6.0" },
+    { name = "zeeker", specifier = ">=0.9.0" },
 ]
 
 [package.metadata.requires-dev]

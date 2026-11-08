@@ -24,6 +24,10 @@ checkpoint_*.json
 # Phase 2 extraction cache (raw HTML archive + parsed extractions)
 .cache/
 
+# Build logs and Phase 3 progress stream
+*.log
+phase3_progress.jsonl
+
 # OS
 .DS_Store
 Thumbs.db

@@ -110,7 +110,7 @@ When implementing resources that need external libraries:
   `content_text` + `court_summary` on the main row and emits per-paragraph
   rows into `judgments_fragments`. Runs in the **same** `fetch_data()`
   invocation as Phase 1 (after discovery, before return), so there is one
-  resource, one build command, two phases per run. Default cap is 15 docs
+  resource, one build command, two phases per run. Default cap is 50 docs
   per build — with a 10,588-doc backlog, expect hundreds of runs to drain.
   Fragments are inserted inline from `fetch_data` (not via
   `fetch_fragments_data`, which is a no-op stub); see the "Implementation
@@ -120,7 +120,7 @@ When implementing resources that need external libraries:
   **same** `fetch_data()` invocation after Phase 2, so one
   `zeeker build judgments` drains all three backlogs on a single pass.
   Skips gracefully when `LLM_BASE_URL` is unset (local-first — no cloud
-  dependency required). Default cap is 15 docs per build; see "Phase 3
+  dependency required). Default cap is 50 docs per build; see "Phase 3
   implementation notes" below.
 - **Deployment (deferred):** No S3 workflow wired up yet. The
   auto-generated `.github/workflows/deploy.yml` is inert until secrets are
@@ -254,16 +254,7 @@ sketch once we hit real code. Future-you should know about these:
    never fires. `_ensure_fragments_table` creates the table with
    `pk="id"` up front (see `FRAGMENT_COLUMNS` in `resources/judgments.py`).
 
-4. **Env-var sentinel guards against zeeker's module reload.** When
-   `fragments = true`, zeeker re-imports the resource module and calls
-   `fetch_data` a second time to build `main_data_context`. Module-level
-   variables don't survive the reload, so `_JUDGMENTS_PHASE2_RAN_PID`
-   lives in `os.environ` (process-scoped, survives the reload, naturally
-   cleared across builds). Second call sees the matching PID and skips
-   Phase 2 entirely. Without this, every build would enrich
-   `2 × EXTRACT_MAX_PER_RUN` docs instead of the budgeted number.
-
-5. **Two-layer disk cache under `.cache/`** (gitignored):
+4. **Two-layer disk cache under `.cache/`** (gitignored):
    - `.cache/judgments_html/{id}.html.gz` — raw detail-page HTML, gzipped.
      Source of truth for re-extraction. If parsing rules change, delete
      `.cache/judgments_extractions/` and re-run — no server traffic.
@@ -274,17 +265,18 @@ sketch once we hit real code. Future-you should know about these:
      re-parsing. Atomic writes (`tmp` + `os.replace`) prevent half-
      written files on crash.
 
-6. **Failure quarantine.** `checkpoint_judgments_extraction.json` tracks
+5. **Failure quarantine.** `checkpoint_judgments_extraction.json` tracks
    per-judgment failure count, last error, and last-attempt timestamp.
    After `EXTRACT_MAX_RETRIES` failures a doc is quarantined for
    `EXTRACT_RETRY_AFTER` seconds before the next attempt. This prevents
    a single broken page from burning the whole daily budget.
 
-7. **Sibling-module import hack in `resources/judgments.py`.** Zeeker
-   loads resource files via `importlib.util.spec_from_file_location`,
-   which bypasses package imports — `from resources import extraction`
-   fails at build time. We prepend `Path(__file__).parent` to `sys.path`
-   before importing sibling modules.
+6. **Sibling-module imports are plain top-level imports.** zeeker >= 0.9.0
+   puts `resources/` on `sys.path` while a resource module loads, so
+   `import extraction` etc. work directly — but ONLY at module top level
+   (the path entry is removed after load, so lazy in-function sibling
+   imports would fail). `tests/conftest.py` adds the same path for the
+   test suite.
 
 **Env vars (Phase 2):** set `JUDGMENTS_EXTRACT_ENABLED=0` to skip Phase 2
 entirely (useful during the initial Phase-1 archive crawl). The rest are
@@ -293,8 +285,7 @@ in the knob table below.
 ### Phase 3 implementation notes
 
 Phase 3 mirrors Phase 2's shape: batch-limited backfill, checkpointed
-failure tracking, disk cache for crash recovery, env-var sentinel to
-survive zeeker's module reload. The deltas worth knowing:
+failure tracking, disk cache for crash recovery. The deltas worth knowing:
 
 1. **The skill's naive `text[:4000]` truncation throws away the
    holding.** The zeeker-source-creator skill's suggested summariser
@@ -325,11 +316,7 @@ survive zeeker's module reload. The deltas worth knowing:
    `parse_listing_page`). Writes go through `_update_row` because zeeker
    didn't declare a primary key on `judgments`.
 
-4. **Env-var sentinel (`_JUDGMENTS_PHASE3_RAN_PID`) guards the module
-   reload.** Identical mechanism to Phase 2 — without it every build
-   would summarise `2 × SUMMARY_MAX_PER_RUN` docs.
-
-5. **Cache under `.cache/judgments_summaries/{id}.json`.** Survives
+4. **Cache under `.cache/judgments_summaries/{id}.json`.** Survives
    crashes after the LLM call but before the DB `UPDATE`. If parsing/
    prompting rules change, delete the JSONs and reset the rows' `summary`
    column to NULL to force regeneration. Atomic writes via tmp +
@@ -362,16 +349,17 @@ vars (handy for smoke tests — no code edits required):
 | `JUDGMENTS_DELAY_BASE` | `1.5` | Phase 1: base sleep (s) between listing-page fetches. |
 | `JUDGMENTS_DELAY_JITTER` | `0.5` | Phase 1: +/- jitter added to the base sleep. |
 | `JUDGMENTS_EXTRACT_ENABLED` | `1` | Phase 2: set to `0` to run discovery only (skip enrichment). |
-| `JUDGMENTS_EXTRACT_MAX_PER_RUN` | `15` | Phase 2: max docs enriched per `zeeker build`. |
+| `JUDGMENTS_EXTRACT_MAX_PER_RUN` | `50` | Phase 2: max docs enriched per `zeeker build`. |
 | `JUDGMENTS_EXTRACT_MAX_RETRIES` | `3` | Phase 2: failures before a doc is quarantined. |
 | `JUDGMENTS_EXTRACT_RETRY_AFTER` | `86400` | Phase 2: quarantine TTL in seconds (default 24h). |
 | `JUDGMENTS_EXTRACT_DELAY_BASE` | `1.5` | Phase 2: base sleep (s) between detail-page fetches. |
 | `JUDGMENTS_EXTRACT_DELAY_JITTER` | `0.5` | Phase 2: +/- jitter on the sleep. |
 | `JUDGMENTS_SUMMARY_ENABLED` | `1` | Phase 3: set to `0` to skip summarisation. |
-| `JUDGMENTS_SUMMARY_MAX_PER_RUN` | `15` | Phase 3: max docs summarised per `zeeker build`. |
+| `JUDGMENTS_SUMMARY_MAX_PER_RUN` | `50` | Phase 3: max docs summarised per `zeeker build`. |
 | `JUDGMENTS_SUMMARY_MAX_BATCHES` | `20` | Phase 3: max rolling-pass batches per doc (wider batch_size for large docs). |
-| `JUDGMENTS_SUMMARY_MAX_RETRIES` | `3` | Phase 3: failures before a doc is quarantined. |
-| `JUDGMENTS_SUMMARY_RETRY_AFTER` | `86400` | Phase 3: quarantine TTL in seconds (default 24h). |
+| `JUDGMENTS_SUMMARY_MAX_RETRIES` | `3` | Phase 3: primary-model failures before a doc escalates to the alt-model priority pool. |
+| `JUDGMENTS_SUMMARY_HARD_FAIL_LIMIT` | `6` | Phase 3: TOTAL failures (primary + alt) before a doc is hard-quarantined instead of retried every build. |
+| `JUDGMENTS_SUMMARY_RETRY_AFTER_HARD` | `604800` | Phase 3: hard-quarantine TTL in seconds (default 1 week) between attempts once a doc hits the hard-fail limit. |
 | `JUDGMENTS_SUMMARY_MAX_INPUT_CHARS` | `32000` | Phase 3: char budget for composed LLM input (~8K tokens). |
 | `LLM_BASE_URL` | *unset* | Phase 3: OpenAI-compatible endpoint. Unset → Phase 3 skips. |
 | `LLM_API_KEY` | `not-needed` | Phase 3: optional for local servers; required for cloud. |
@@ -403,8 +391,8 @@ vars (handy for smoke tests — no code edits required):
 - **Batch-crawl pacing (Phase 1):** at defaults, ~50 pages ≈ 75s sleep +
   fetch/parse. Each run lands ~500 new records; ~22 runs cover the full
   archive.
-- **Enrichment pacing (Phase 2):** at defaults, ~15 docs ≈ 25s per run.
-  With a 10,588-doc backlog expect ~700 runs to drain. Set
+- **Enrichment pacing (Phase 2):** at defaults, ~50 docs ≈ 85s per run.
+  With a 10,588-doc backlog expect ~200 runs to drain. Set
   `JUDGMENTS_EXTRACT_MAX_PER_RUN` higher if the source is cooperating,
   lower (or `0` via `JUDGMENTS_EXTRACT_ENABLED=0`) if it's flaky.
 - **Politeness:** single `httpx.Client` connection pool shared across
@@ -415,10 +403,16 @@ vars (handy for smoke tests — no code edits required):
 - **Build:** `uv run zeeker build judgments`. Re-invoke the same command
   to continue a batch crawl (checkpoint drives resume) and/or drain
   more of the enrichment backlog.
-- **zeeker quirk (dodged in Phase 2):** when `fragments = true` in
-  `zeeker.toml`, zeeker reloads the module and calls `fetch_data` a
-  second time to build fragment context. Our env-var sentinel
-  (`_JUDGMENTS_PHASE2_RAN_PID`) makes the second call skip Phase 2.
+- **Single-fetch lifecycle (zeeker >= 0.9.0):** `fetch_data` runs exactly
+  once per build — no module reload, no second fetch for fragment
+  context — so Phases 2/3 run exactly once with no sentinel guards.
+- **Status reporting (zeeker >= 0.9.0):** `fetch_data` sets
+  `__zeeker_report__` with `extracted` / `summarised` /
+  `extract_backlog` / `summary_backlog` counters (rendered on the
+  `[OK]`/`[SKIP]` line and in `--json`), and raises
+  `Skip("discovery aborted: …", kind="blocked")` when discovery aborted
+  AND zero work happened in any phase — see RUNBOOK.md for the full
+  status contract.
 
 ### Smoke test playbook
 **Phase 1 (discovery only):**
@@ -448,7 +442,7 @@ vars (handy for smoke tests — no code edits required):
    content_text=NULL WHERE id IN (…)`, re-run — expect parsing from
    archived HTML, no server traffic.
 
-**Unit + fixture tests:** `uv run pytest tests/` (39 tests, ~0.3s).
+**Unit + fixture tests:** `uv run pytest tests/` (71 tests, ~1s).
 
 ### Data source notes
 - Catchwords (`subject_tags`) are hierarchical: `Subject — Topic — Sub —
@@ -463,5 +457,10 @@ vars (handy for smoke tests — no code edits required):
 
 ---
 
-This file is automatically created by Zeeker and can be customized for your project's needs.
-The main Zeeker development guide is in the repository root CLAUDE.md file.
+## Build monitoring
+
+Operational knowledge — run narrative, status contract (Skip kinds,
+`__zeeker_report__` counters), cadence and yield expectations, failure
+modes, quarantine/checkpoint/cache recovery, and backlog SQL — lives in
+**RUNBOOK.md**. Monitoring agents should read that file, not this one.
+This file keeps development-specific guidance only.

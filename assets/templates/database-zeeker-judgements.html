@@ -1,0 +1,15 @@
+{% extends "default:database.html" %}
+
+{% block extra_head %}
+{{ super() }}
+<meta name="description" content="Custom database: zeeker-judgements">
+{% endblock %}
+
+{% block content %}
+<div class="custom-database-header">
+    <h1>📊 Zeeker-Judgements Database</h1>
+    <p>Welcome to the zeeker-judgements database</p>
+</div>
+
+{{ super() }}
+{% endblock %}

@@ -9,7 +9,8 @@ Scope:    ~10,588 judgments across SGCA, SGHC, SGHCA, SGHCF, SGHCR, SGDC,
 Cadence:  Tier 4 one-shot batch for initial backfill; transitions to Tier 1
           daily incremental once the archive is fully discovered.
 
-Two-phase pipeline runs in one fetch_data invocation per build:
+Three-phase pipeline runs in one fetch_data invocation per build
+(fetch_data runs exactly once — zeeker >= 0.9.0 single-fetch lifecycle):
 
 Phase 1 (discovery): scrape listing pages, persist catalog metadata
   (citation, case name, court, date, subject tags, source_url, pdf_url).
@@ -20,10 +21,8 @@ Phase 2 (enrichment): for each existing row with ``content_text IS NULL``,
   via resources.extraction, archive raw HTML under ``.cache/judgments_html/``
   and parsed output under ``.cache/judgments_extractions/``, then
   ``existing_table.update()`` the row with content_text, court_summary,
-  has_content, has_court_summary, fragment_count, extracted_at. The extraction
-  cache is the source of truth that ``fetch_fragments_data`` reads from —
-  zeeker reloads this module between main-table and fragment phases, so any
-  in-memory state would be lost. Disk cache survives the reload and any
+  has_content, has_court_summary, fragment_count, extracted_at. Fragment
+  rows are inserted in the same transaction; the disk caches survive any
   crash mid-run (atomic writes).
 
 Crawl strategy (shared)
@@ -42,8 +41,8 @@ Phase-1 specifics
 
 Phase-2 specifics
 -----------------
-- Batch cap: ``EXTRACT_MAX_PER_RUN`` (~15 docs per run, conservative given
-  the source is flaky).
+- Batch cap: ``EXTRACT_MAX_PER_RUN`` (~50 docs per run by default; lower it
+  if the source is flaky).
 - Failure tracking: ``checkpoint_judgments_extraction.json`` records per-id
   failure count + last error + last attempt timestamp. After
   ``EXTRACT_MAX_RETRIES`` failures a doc is quarantined until
@@ -60,7 +59,6 @@ import json
 import os
 import random
 import re
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -68,8 +66,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urljoin
 
 import click
+
+# Sibling modules in resources/ import directly: zeeker >= 0.9.0 puts this
+# directory on sys.path while the module loads (top-level imports only).
+import extraction
+import extraction_cache
 import httpx
+import summarization
+import summary_cache
 from bs4 import BeautifulSoup
+from extraction import ExtractionError
 from sqlite_utils.db import Table
 from tenacity import (
     retry,
@@ -77,17 +83,7 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
-
-# Zeeker loads resource files via importlib.util.spec_from_file_location,
-# which bypasses package imports — ``from resources import ...`` fails at
-# build time. Make sibling modules importable by adding this file's
-# directory to sys.path before importing them.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import extraction  # noqa: E402
-import extraction_cache  # noqa: E402
-import summarization  # noqa: E402
-import summary_cache  # noqa: E402
-from extraction import ExtractionError  # noqa: E402
+from zeeker import Skip
 
 # =============================================================================
 # CONFIGURATION
@@ -104,6 +100,16 @@ USER_AGENT = "ZeekerBot/1.0 (+https://data.zeeker.sg)"
 
 # Crawl pacing (env-overridable so smoke tests don't require code edits)
 MAX_PAGES_PER_RUN = int(os.environ.get("JUDGMENTS_MAX_PAGES_PER_RUN", "50"))
+# Coverage floor: always fully scan the first N listing pages before the
+# steady-state early exit is honoured. eLitigation publishes some judgments
+# days/weeks after their decision date; they slot into the date-sorted
+# listing at their decision-date position (below newer arrivals), so early
+# pages can hold long runs of known IDs while deeper pages still hold
+# unseen rows. 0 restores the old first-trip stop.
+MIN_PAGES_PER_RUN = int(os.environ.get("JUDGMENTS_MIN_PAGES_PER_RUN", "10"))
+if MIN_PAGES_PER_RUN > MAX_PAGES_PER_RUN:
+    # The batch cap bounds the pages walked per run; the floor cannot exceed it.
+    MIN_PAGES_PER_RUN = MAX_PAGES_PER_RUN
 INCREMENTAL_STOP_THRESHOLD = int(os.environ.get("JUDGMENTS_INCREMENTAL_STOP", "5"))
 REQUEST_DELAY_BASE = float(os.environ.get("JUDGMENTS_DELAY_BASE", "1.5"))
 REQUEST_DELAY_JITTER = float(os.environ.get("JUDGMENTS_DELAY_JITTER", "0.5"))
@@ -121,7 +127,7 @@ SUMMARY_CHECKPOINT_FILE = Path("checkpoint_judgments_summary.json")
 
 # Phase 2 knobs
 EXTRACT_ENABLED = os.environ.get("JUDGMENTS_EXTRACT_ENABLED", "1") == "1"
-EXTRACT_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_EXTRACT_MAX_PER_RUN", "15"))
+EXTRACT_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_EXTRACT_MAX_PER_RUN", "50"))
 EXTRACT_MAX_RETRIES = int(os.environ.get("JUDGMENTS_EXTRACT_MAX_RETRIES", "3"))
 EXTRACT_RETRY_AFTER = int(os.environ.get("JUDGMENTS_EXTRACT_RETRY_AFTER", "86400"))
 EXTRACT_DELAY_BASE = float(os.environ.get("JUDGMENTS_EXTRACT_DELAY_BASE", "1.5"))
@@ -129,16 +135,16 @@ EXTRACT_DELAY_JITTER = float(os.environ.get("JUDGMENTS_EXTRACT_DELAY_JITTER", "0
 
 # Phase 3 knobs
 SUMMARY_ENABLED = os.environ.get("JUDGMENTS_SUMMARY_ENABLED", "1") == "1"
-SUMMARY_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_PER_RUN", "15"))
+SUMMARY_MAX_PER_RUN = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_PER_RUN", "50"))
 SUMMARY_MAX_RETRIES = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_RETRIES", "3"))
-SUMMARY_RETRY_AFTER = int(os.environ.get("JUDGMENTS_SUMMARY_RETRY_AFTER", "86400"))
+# Escalation ceiling: once a doc has failed this many times TOTAL (primary
+# attempts + alt-model priority retries), it stops bypassing quarantine and
+# only gets one attempt per SUMMARY_RETRY_AFTER_HARD window (default 1 week)
+# instead of burning a Phase 3 slot every build.
+SUMMARY_HARD_FAIL_LIMIT = int(os.environ.get("JUDGMENTS_SUMMARY_HARD_FAIL_LIMIT", "6"))
+SUMMARY_RETRY_AFTER_HARD = int(os.environ.get("JUDGMENTS_SUMMARY_RETRY_AFTER_HARD", "604800"))
 SUMMARY_MAX_INPUT_CHARS = int(os.environ.get("JUDGMENTS_SUMMARY_MAX_INPUT_CHARS", "32000"))
 
-# Per-process sentinel so Phase 2 runs ONCE per build even though zeeker
-# reloads this module and re-calls fetch_data to populate fragment context.
-# Module-level vars don't survive the reload; env vars do (same process).
-_PHASE2_SENTINEL_ENV = "_JUDGMENTS_PHASE2_RAN_PID"
-_PHASE3_SENTINEL_ENV = "_JUDGMENTS_PHASE3_RAN_PID"
 _PHASE3_PROGRESS_FILE = Path(__file__).parent.parent / "phase3_progress.jsonl"
 
 
@@ -151,11 +157,6 @@ def _phase3_log(entry: dict) -> None:
     except OSError:
         pass
 
-# Per-process cache — zeeker's fragment build flow may call fetch_data twice
-# (once for main-table insert, once to provide main_data_context for fragments).
-# Caching here keeps the crawl idempotent within a single process so we don't
-# double the HTTP cost or advance the checkpoint past work zeeker will ignore.
-_FETCH_CACHE: Optional[List[Dict[str, Any]]] = None
 
 # Parsing — court alternation is permissive because eLitigation emits codes
 # beyond the "canonical six" (SGHCA appellate division, SGHCR registrar
@@ -519,6 +520,16 @@ def _ensure_fragments_table(db) -> Table:
     return db[FRAGMENTS_TABLE_NAME]
 
 
+def _count_where(table: Optional[Table], where: str) -> int:
+    """Row count for a WHERE clause; 0 when the table/columns don't exist yet."""
+    if table is None:
+        return 0
+    try:
+        return table.count_where(where)
+    except Exception:
+        return 0
+
+
 def _update_row(table: Table, jid: str, updates: Dict[str, Any]) -> None:
     """``UPDATE judgments SET <cols> WHERE id = ?`` — works regardless of PK."""
     if not updates:
@@ -677,30 +688,51 @@ def _enrich_row(
     )
 
 
+def _phase2_stats(**overrides: int) -> Dict[str, int]:
+    stats = {"extracted": 0, "empty": 0, "failed": 0, "quarantined": 0, "backlog": 0}
+    stats.update(overrides)
+    return stats
+
+
 def _run_phase2(
     client: httpx.Client,
     existing_table: Optional[Table],
     breaker: CircuitBreaker,
-) -> None:
+) -> Dict[str, int]:
+    """Drain part of the enrichment backlog. Returns this run's counters.
+
+    Keys: ``extracted`` (rows populated), ``empty`` (structurally empty
+    pages marked done), ``failed``, ``quarantined`` (skipped), and
+    ``backlog`` (NULL-content rows still remaining in the DB).
+    """
+    backlog = _count_where(existing_table, "content_text IS NULL")
     if not EXTRACT_ENABLED:
         click.echo("Phase 2: disabled (JUDGMENTS_EXTRACT_ENABLED=0) — skipping.")
-        return
+        return _phase2_stats(backlog=backlog)
     if existing_table is None:
         # Fresh DB with no Phase 1 rows yet — nothing to enrich.
-        return
+        return _phase2_stats()
     if breaker.is_open:
-        click.echo("Phase 2: circuit breaker open from Phase 1 — skipping.")
-        return
-
-    # Sentinel: zeeker will re-invoke fetch_data after module reload to
-    # build fragment context. Skip Phase 2 on the second call so we don't
-    # double the enrichment budget within one build.
-    if os.environ.get(_PHASE2_SENTINEL_ENV) == str(os.getpid()):
-        click.echo("Phase 2: already ran this build (fragment-context pass) — skipping.")
-        return
-    os.environ[_PHASE2_SENTINEL_ENV] = str(os.getpid())
+        click.echo("Phase 2: circuit breaker open from Phase 1 — skipping.", err=True)
+        return _phase2_stats(backlog=backlog)
 
     _ensure_phase2_columns(existing_table)
+
+    # Index created_at so sg-law-cookies / Datasette timestamp queries don't
+    # time out on the 10k+ row table (unindexed sort = full table scan).
+    existing_table.db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_judgments_created_at ON judgments(created_at)"
+    )
+    # Index decision_date for the same reason: the public browse page
+    # (data.zeeker.sg/zeeker-judgements/judgments) lists rows ordered by
+    # decision_date DESC. Without this index the default listing
+    # (SELECT rowid, * ... ORDER BY decision_date DESC LIMIT 101) full-scans
+    # and sorts the multi-GB table, intermittently exceeding datasette's
+    # sql_time_limit_ms → 400 "SQL query took too long" → frontend 503s
+    # (observed since Jul 2026, see datasette-500-favicon-csv-errors).
+    existing_table.db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_judgments_decision_date ON judgments(decision_date)"
+    )
 
     state = load_extraction_state()
     now = datetime.now()
@@ -713,7 +745,7 @@ def _run_phase2(
     remaining_total = len(candidates)
     if remaining_total == 0:
         click.echo("Phase 2: no rows need enrichment.")
-        return
+        return _phase2_stats()
 
     click.echo(
         f"Phase 2: enriching up to {EXTRACT_MAX_PER_RUN} / {remaining_total} "
@@ -726,27 +758,29 @@ def _run_phase2(
     transient_failures = 0
     skipped_quarantined = 0
     attempted = 0
+    aborted = False
 
     try:
         for row in candidates:
             if attempted >= EXTRACT_MAX_PER_RUN:
                 break
             if breaker.is_open:
-                click.echo("Phase 2: circuit breaker tripped — stopping early.")
+                click.echo("Phase 2: circuit breaker tripped — stopping early.", err=True)
+                aborted = True
                 break
             jid = row["id"]
             if _is_quarantined(state, jid, now):
                 skipped_quarantined += 1
                 continue
             attempted += 1
-            label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
+            label = f"[{row.get('court') or '?'}] {row.get('citation') or jid}"
             try:
                 status, detail = _enrich_row(client, row, existing_table, breaker)
             except Exception as exc:  # defensive — should be rare
                 transient_failures += 1
                 _record_extraction_failure(state, jid, exc)
                 click.echo(
-                    f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → UNEXPECTED: {exc}", err=True
+                    f"  {attempted}/{EXTRACT_MAX_PER_RUN} {label} → UNEXPECTED: {exc}", err=True
                 )
                 save_extraction_state(state)
                 continue
@@ -754,17 +788,17 @@ def _run_phase2(
             if status == "ok":
                 successes += 1
                 _clear_extraction_failure(state, jid)
-                click.echo(f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → {detail}")
+                click.echo(f"  {attempted}/{EXTRACT_MAX_PER_RUN} {label} → {detail}")
             elif status == "empty":
                 structurally_empty += 1
                 _clear_extraction_failure(state, jid)  # structural, not transient
-                click.echo(f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → empty ({detail})")
+                click.echo(f"  {attempted}/{EXTRACT_MAX_PER_RUN} {label} → empty ({detail})")
             else:  # http_error
                 transient_failures += 1
                 fake = RuntimeError(detail or "http error")
                 _record_extraction_failure(state, jid, fake)
                 click.echo(
-                    f"  {attempted}/{EXTRACT_MAX_PER_RUN} [{label} → fetch failed: {detail}",
+                    f"  {attempted}/{EXTRACT_MAX_PER_RUN} {label} → fetch failed: {detail}",
                     err=True,
                 )
             save_extraction_state(state)
@@ -773,11 +807,23 @@ def _run_phase2(
         save_extraction_state(state)
         raise
 
-    click.echo(
-        f"Phase 2 complete: {successes} extracted, {structurally_empty} empty-body, "
+    remaining = remaining_total - successes - structurally_empty
+    counts = (
+        f"{successes} extracted, {structurally_empty} empty-body, "
         f"{transient_failures} fetch-failed, {skipped_quarantined} quarantined; "
-        f"{remaining_total - successes - structurally_empty} NULL-content rows "
+        f"{remaining} NULL-content rows "
         f"remain in DB."
+    )
+    if aborted:
+        click.echo(f"Phase 2 ABORTED (circuit breaker): {counts}", err=True)
+    else:
+        click.echo(f"Phase 2 complete: {counts}")
+    return _phase2_stats(
+        extracted=successes,
+        empty=structurally_empty,
+        failed=transient_failures,
+        quarantined=skipped_quarantined,
+        backlog=remaining,
     )
 
 
@@ -821,17 +867,29 @@ def _clear_summary_failure(state: dict, jid: str) -> None:
 
 
 def _is_summary_quarantined(state: dict, jid: str, now: datetime) -> bool:
+    """Escalating quarantine — three tiers by total failure count:
+
+    - ``count < SUMMARY_MAX_RETRIES``: never quarantined; retried with the
+      primary model each build.
+    - ``SUMMARY_MAX_RETRIES <= count < SUMMARY_HARD_FAIL_LIMIT``: never
+      quarantined; these are the priority pool that deliberately bypasses
+      any TTL so the alt endpoint gets its retries.
+    - ``count >= SUMMARY_HARD_FAIL_LIMIT``: both endpoints have had their
+      chances — hard-quarantined for SUMMARY_RETRY_AFTER_HARD (default
+      1 week) after the last attempt, so a persistently failing doc stops
+      burning a Phase 3 slot every build (issue #3).
+    """
     entry = state.get("failures", {}).get(jid)
     if entry is None:
         return False
-    if int(entry.get("count", 0)) < SUMMARY_MAX_RETRIES:
+    if int(entry.get("count", 0)) < SUMMARY_HARD_FAIL_LIMIT:
         return False
     last_attempt_str = entry.get("last_attempt") or ""
     try:
         last_attempt = datetime.fromisoformat(last_attempt_str)
     except ValueError:
         return False
-    return (now - last_attempt).total_seconds() < SUMMARY_RETRY_AFTER
+    return (now - last_attempt).total_seconds() < SUMMARY_RETRY_AFTER_HARD
 
 
 def _ensure_phase3_columns(table: Table) -> None:
@@ -870,6 +928,7 @@ def _summarise_row(
                 or datetime.now().isoformat(timespec="seconds"),
             },
         )
+        existing_table.db.conn.commit()
         return "cached", None
 
     fragments = (
@@ -890,6 +949,12 @@ def _summarise_row(
     if not summary_text:
         return "error", "empty response"
 
+    # Smell test: reject obviously bad summaries before persisting.
+    frag_count = row.get("fragment_count") or len(fragments)
+    result = summarization.smell_test(summary_text, fragment_count=frag_count)
+    if not result["passed"]:
+        return "error", f"smell_test: {'; '.join(result['issues'])}"
+
     now_iso = datetime.now().isoformat(timespec="seconds")
     endpoint = endpoint or os.environ.get("LLM_BASE_URL", "")
     summary_cache.write_summary_atomic(
@@ -908,25 +973,36 @@ def _summarise_row(
         jid,
         {"summary": summary_text, "summary_generated_at": now_iso},
     )
+    existing_table.db.conn.commit()
     return "ok", f"{len(summary_text)} chars"
 
 
-def _run_phase3(existing_table: Optional[Table]) -> None:
+def _phase3_stats(**overrides: int) -> Dict[str, int]:
+    stats = {"summarised": 0, "cached": 0, "failed": 0, "quarantined": 0, "backlog": 0}
+    stats.update(overrides)
+    return stats
+
+
+def _run_phase3(existing_table: Optional[Table]) -> Dict[str, int]:
+    """Drain part of the summarisation backlog. Returns this run's counters.
+
+    Keys: ``summarised`` (fresh LLM summaries), ``cached`` (recovered from
+    disk cache), ``failed``, ``quarantined`` (skipped), and ``backlog``
+    (enriched rows still lacking a summary).
+    """
+    backlog = _count_where(existing_table, "has_content = 1 AND summary IS NULL")
     if not SUMMARY_ENABLED:
         click.echo("Phase 3: disabled (JUDGMENTS_SUMMARY_ENABLED=0) — skipping.")
-        return
+        return _phase3_stats(backlog=backlog)
     if existing_table is None:
-        return
-    if os.environ.get(_PHASE3_SENTINEL_ENV) == str(os.getpid()):
-        click.echo("Phase 3: already ran this build (fragment-context pass) — skipping.")
-        return
-    os.environ[_PHASE3_SENTINEL_ENV] = str(os.getpid())
+        return _phase3_stats()
 
     client = summarization.make_client()
     if client is None:
         click.echo("Phase 3: LLM not configured (LLM_BASE_URL unset) — skipping.")
-        return
+        return _phase3_stats(backlog=backlog)
 
+    client_alt = summarization.make_client_alt()
     _ensure_phase3_columns(existing_table)
     model = summarization.resolve_model()
     model_alt = summarization.resolve_model_alt()
@@ -943,13 +1019,16 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
     remaining_total = len(all_candidates)
     if remaining_total == 0:
         click.echo("Phase 3: no rows need summarisation.")
-        return
+        return _phase3_stats()
 
-    # Priority queue: quarantined docs (fail_count >= SUMMARY_MAX_RETRIES) fill first,
-    # then date-ordered fresh docs. Quarantined docs bypass the TTL check — they're
-    # here specifically to be retried on the (potentially updated) endpoint.
+    # Priority queue: escalated docs (fail_count >= SUMMARY_MAX_RETRIES) fill first,
+    # then date-ordered fresh docs. Escalated docs are retried on the alt endpoint
+    # and bypass any TTL — until they hit SUMMARY_HARD_FAIL_LIMIT total failures,
+    # after which the loop's hard-quarantine check skips them for
+    # SUMMARY_RETRY_AFTER_HARD between attempts.
     quarantined_ids = {
-        jid for jid, info in state.get("failures", {}).items()
+        jid
+        for jid, info in state.get("failures", {}).items()
         if info.get("count", 0) >= SUMMARY_MAX_RETRIES
     }
     priority_docs = [r for r in all_candidates if r["id"] in quarantined_ids]
@@ -962,9 +1041,16 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
         f"remaining (model={model}{alt_label}, max_chars={SUMMARY_MAX_INPUT_CHARS}, "
         f"priority={len(priority_docs)})"
     )
-    _phase3_log({"event": "start", "ts": datetime.now().isoformat(timespec="seconds"),
-                 "remaining": remaining_total, "model": model, "model_alt": model_alt,
-                 "priority_quarantined": len(priority_docs)})
+    _phase3_log(
+        {
+            "event": "start",
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "remaining": remaining_total,
+            "model": model,
+            "model_alt": model_alt,
+            "priority_quarantined": len(priority_docs),
+        }
+    )
 
     successes = 0
     cached_hits = 0
@@ -977,72 +1063,122 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
             if attempted >= SUMMARY_MAX_PER_RUN:
                 break
             jid = row["id"]
-            fail_count = state.get("failures", {}).get(jid, {}).get("count", 0)
-            # Quarantined docs (fail_count >= SUMMARY_MAX_RETRIES) bypass TTL —
-            # they were promoted to priority slots to be retried. Fresh docs still
-            # respect TTL to avoid hammering on transient failures.
-            if fail_count < SUMMARY_MAX_RETRIES and _is_summary_quarantined(state, jid, now):
+            # Docs at or past SUMMARY_HARD_FAIL_LIMIT are hard-quarantined for
+            # SUMMARY_RETRY_AFTER_HARD; below that, priority docs bypass any
+            # TTL so the alt endpoint gets its retries (see
+            # _is_summary_quarantined for the full tier breakdown). Skips
+            # happen before ``attempted`` increments, so they cost nothing.
+            if _is_summary_quarantined(state, jid, now):
                 skipped_quarantined += 1
                 continue
             attempted += 1
-            endpoint = os.environ.get("LLM_BASE_URL", "")
             is_priority = jid in quarantined_ids
             use_model = model_alt if is_priority else model
-            label = f"{row.get('court') or '?'}] {row.get('citation') or jid}"
+            use_client = client_alt if (is_priority and client_alt is not None) else client
+            endpoint = os.environ.get(
+                "LLM_BASE_URL_2" if (is_priority and client_alt is not None) else "LLM_BASE_URL", ""
+            )
+            label = f"[{row.get('court') or '?'}] {row.get('citation') or jid}"
             priority_tag = " [alt-model]" if is_priority else ""
             try:
-                status, detail = _summarise_row(row, existing_table, client, use_model, endpoint=endpoint)
+                status, detail = _summarise_row(
+                    row, existing_table, use_client, use_model, endpoint=endpoint
+                )
             except Exception as exc:  # defensive
                 failures += 1
                 _record_summary_failure(state, jid, exc)
                 click.echo(
-                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → UNEXPECTED: {exc}",
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} {label}{priority_tag} → UNEXPECTED: {exc}",
                     err=True,
                 )
-                _phase3_log({
-                    "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
-                    "n": attempted, "id": jid,
-                    "citation": row.get("citation"), "court": row.get("court"),
-                    "status": "error", "detail": f"UNEXPECTED: {exc}",
-                    "model": use_model, "alt": is_priority,
-                })
+                _phase3_log(
+                    {
+                        "event": "attempt",
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "n": attempted,
+                        "id": jid,
+                        "citation": row.get("citation"),
+                        "court": row.get("court"),
+                        "status": "error",
+                        "detail": f"UNEXPECTED: {exc}",
+                        "model": use_model,
+                        "alt": is_priority,
+                    }
+                )
                 save_summary_state(state)
                 continue
 
             if status == "ok":
                 successes += 1
                 _clear_summary_failure(state, jid)
-                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → {detail}")
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} {label}{priority_tag} → {detail}")
             elif status == "cached":
                 cached_hits += 1
                 _clear_summary_failure(state, jid)
-                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → cached")
+                click.echo(f"  {attempted}/{SUMMARY_MAX_PER_RUN} {label}{priority_tag} → cached")
             else:  # error
                 failures += 1
                 fake = RuntimeError(detail or "llm error")
                 _record_summary_failure(state, jid, fake)
                 click.echo(
-                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} [{label}{priority_tag} → llm failed: {detail}",
+                    f"  {attempted}/{SUMMARY_MAX_PER_RUN} {label}{priority_tag} → llm failed: {detail}",
                     err=True,
                 )
-            _phase3_log({
-                "event": "attempt", "ts": datetime.now().isoformat(timespec="seconds"),
-                "n": attempted, "id": jid,
-                "citation": row.get("citation"), "court": row.get("court"),
-                "status": status, "detail": detail,
-                "model": use_model, "alt": is_priority,
-            })
+            _phase3_log(
+                {
+                    "event": "attempt",
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "n": attempted,
+                    "id": jid,
+                    "citation": row.get("citation"),
+                    "court": row.get("court"),
+                    "status": status,
+                    "detail": detail,
+                    "model": use_model,
+                    "alt": is_priority,
+                }
+            )
             save_summary_state(state)
     except KeyboardInterrupt:
         click.echo("Phase 3 interrupted — state saved", err=True)
         save_summary_state(state)
+        _phase3_log(
+            {
+                "event": "interrupted",
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "successes": successes,
+                "cached": cached_hits,
+                "failures": failures,
+                "skipped_quarantined": skipped_quarantined,
+                "remaining": remaining_total - successes - cached_hits,
+            }
+        )
         raise
 
     save_summary_state(state)
+    _phase3_log(
+        {
+            "event": "complete",
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "successes": successes,
+            "cached": cached_hits,
+            "failures": failures,
+            "skipped_quarantined": skipped_quarantined,
+            "remaining": remaining_total - successes - cached_hits,
+        }
+    )
+    remaining = remaining_total - successes - cached_hits
     click.echo(
         f"Phase 3 complete: {successes} summarised, {cached_hits} from cache, "
         f"{failures} failed, {skipped_quarantined} quarantined; "
-        f"{remaining_total - successes - cached_hits} NULL-summary rows remain."
+        f"{remaining} NULL-summary rows remain."
+    )
+    return _phase3_stats(
+        summarised=successes,
+        cached=cached_hits,
+        failed=failures,
+        quarantined=skipped_quarantined,
+        backlog=remaining,
     )
 
 
@@ -1052,18 +1188,18 @@ def _run_phase3(existing_table: Optional[Table]) -> None:
 def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     """Discover judgment catalog records from listing pages.
 
-    Respects ``MAX_PAGES_PER_RUN`` (batch limit) and
-    ``INCREMENTAL_STOP_THRESHOLD`` (steady-state early exit).
+    Respects ``MIN_PAGES_PER_RUN`` (guaranteed coverage floor),
+    ``MAX_PAGES_PER_RUN`` (batch limit) and ``INCREMENTAL_STOP_THRESHOLD``
+    (steady-state early exit, honoured only from page MIN+1 onward).
     State persisted to ``checkpoint_judgments_discovery.json``.
-    """
-    global _FETCH_CACHE
-    if _FETCH_CACHE is not None:
-        click.echo(
-            f"fetch_data: returning {len(_FETCH_CACHE)} cached records "
-            f"(already fetched this process)"
-        )
-        return _FETCH_CACHE
 
+    Runs exactly once per build (zeeker >= 0.9.0 single-fetch lifecycle),
+    with Phases 2 and 3 draining their backlogs before this returns. Their
+    counters are surfaced via the module-level ``__zeeker_report__``. When
+    discovery aborts (fetch failure / HTTP error) and NO work happened in
+    any phase, raises ``Skip(kind="blocked")`` so the build shows the
+    outage instead of a healthy-looking "no data returned".
+    """
     existing_ids: set[str] = set()
     if existing_table is not None:
         existing_ids = {row["id"] for row in existing_table.rows}
@@ -1075,6 +1211,9 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     staged: List[Dict[str, Any]] = [
         r for r in checkpoint.get("items_collected", []) if r["id"] not in existing_ids
     ]
+    # Staged-but-not-yet-inserted items must be treated as known, or the walk
+    # below re-discovers them from the listing and stages them a second time.
+    existing_ids.update(r["id"] for r in staged)
     total_pages: Optional[int] = checkpoint.get("total_pages")
 
     breaker = CircuitBreaker()
@@ -1083,6 +1222,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     page = start_page
     url = urljoin(BASE_URL, INDEX_PATH)
     exhausted = False
+    abort_reason: Optional[str] = None
 
     def _snapshot(last_completed_page: int) -> dict:
         return {
@@ -1117,7 +1257,8 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                     breaker.record_failure()
                     click.echo(f"  → Fetch failed after retries: {exc}", err=True)
                     save_checkpoint(_snapshot(page - 1))
-                    click.echo("Aborting run — checkpoint saved. Try again later.")
+                    click.echo("Aborting run — checkpoint saved. Try again later.", err=True)
+                    abort_reason = "fetch failure"
                     break
 
                 if response.status_code == 404:
@@ -1131,6 +1272,7 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                         err=True,
                     )
                     save_checkpoint(_snapshot(page - 1))
+                    abort_reason = f"HTTP {response.status_code}"
                     break
 
                 breaker.record_success()
@@ -1154,6 +1296,22 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
                     if item["id"] in existing_ids:
                         consecutive_known += 1
                         if consecutive_known >= INCREMENTAL_STOP_THRESHOLD:
+                            if pages_this_run < MIN_PAGES_PER_RUN:
+                                # Coverage floor: late-published judgments
+                                # slot into the listing at their decision-date
+                                # position (below the new arrivals), so the
+                                # first pages can contain long runs of known
+                                # IDs even when deeper pages hold unseen
+                                # rows. Keep walking through the guaranteed
+                                # pages; reset the counter so the threshold
+                                # applies fresh from page MIN+1 onward.
+                                click.echo(
+                                    f"  {consecutive_known} consecutive known IDs "
+                                    f"within guaranteed pages "
+                                    f"({pages_this_run + 1}/{MIN_PAGES_PER_RUN}) — continuing."
+                                )
+                                consecutive_known = 0
+                                continue
                             click.echo(
                                 f"Stopping: {consecutive_known} consecutive known IDs — "
                                 f"steady-state mode."
@@ -1198,19 +1356,52 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         if exhausted:
             clear_checkpoint()
 
-        click.echo(f"Discovery run complete: {len(staged)} new records, {breaker.summary()}")
+        if abort_reason is not None:
+            click.echo(
+                f"Discovery ABORTED ({abort_reason}): {len(staged)} new records, "
+                f"{breaker.summary()}",
+                err=True,
+            )
+        else:
+            click.echo(f"Discovery OK: {len(staged)} new records, {breaker.summary()}")
 
         # Phase 2 runs inside the same client context so it reuses the
         # connection pool. Uses the breaker state from Phase 1 — if the
         # source was flaky during discovery we skip enrichment entirely.
-        _run_phase2(client, existing_table, breaker)
+        p2 = _run_phase2(client, existing_table, breaker)
 
     # Phase 3 lives outside the httpx client block — the LLM call goes
     # through its own OpenAI-compatible client, not the eLitigation
     # connection pool.
-    _run_phase3(existing_table)
+    p3 = _run_phase3(existing_table)
 
-    _FETCH_CACHE = staged
+    # Surface enrichment work on the build status line and in --json —
+    # zeeker reads (and clears) this module-level dict on every exit path,
+    # including the Skip raised below.
+    summarised = p3["summarised"] + p3["cached"]
+    notes_parts = []
+    if abort_reason is not None:
+        notes_parts.append(f"discovery aborted ({abort_reason})")
+    notes_parts.append(f"phase2 +{p2['extracted']} extracted ({p2['backlog']} backlog)")
+    notes_parts.append(f"phase3 +{summarised} summarised ({p3['backlog']} backlog)")
+    global __zeeker_report__
+    __zeeker_report__ = {
+        "extracted": p2["extracted"],
+        "summarised": summarised,
+        "extract_backlog": p2["backlog"],
+        "summary_backlog": p3["backlog"],
+        "notes": "; ".join(notes_parts),
+    }
+
+    # All-idle abort: discovery could not check the source AND no rows were
+    # staged AND enrichment/summarisation did no work either. Raise a
+    # "blocked" Skip so the freshness marker does not advance. Any partial
+    # progress (staged rows, enriched or summarised docs) is persisted by
+    # returning normally instead.
+    enrichment_worked = (p2["extracted"] + p2["empty"] + summarised) > 0
+    if abort_reason is not None and not staged and not enrichment_worked:
+        raise Skip(f"discovery aborted: {abort_reason}", kind="blocked")
+
     return staged
 
 
