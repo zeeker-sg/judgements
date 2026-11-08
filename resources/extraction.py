@@ -12,6 +12,7 @@ rules) that this module encodes.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -64,6 +65,60 @@ def _normalize_ws(text: str) -> str:
     return text.translate(_WS_TRANSLATION) if text else text
 
 
+# Tags that render as their own block. Only these boundaries become a
+# space when flattening to text: inline markup must add nothing, because
+# eLitigation splits words across spans mid-word ("Lee H</span><span>sien
+# Loong") and wraps italic short names inside quotes ("(“<span>KS v
+# LHY</span>”)"). BS4's ``get_text(" ")`` put a space at every tag edge,
+# which produced "Lee H sien Loong" and "(“ KS v LHY ”)".
+BLOCK_TAGS = [
+    "div", "p", "li", "ul", "ol", "tr", "td", "th", "table", "blockquote",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+]  # fmt: skip
+
+_WS_RUN_RE = re.compile(r"\s+")
+
+
+def element_text(element: Tag) -> str:
+    """Flatten ``element`` to one line of text the way a browser shows it.
+
+    Block boundaries and ``<br>`` become a single space; inline tags join
+    their text with nothing added. All whitespace runs (including U+00A0
+    and U+2003) collapse to one ASCII space. Works on a copy, so the
+    caller's tree is untouched.
+    """
+    root = copy.copy(element)
+    for br in root.find_all("br"):
+        br.replace_with(" ")
+    for tag in root.find_all(BLOCK_TAGS):
+        tag.insert_before(" ")
+        tag.insert_after(" ")
+    return _WS_RUN_RE.sub(" ", _normalize_ws(root.get_text())).strip()
+
+
+def _is_footnote_id(value: Optional[str]) -> bool:
+    return bool(value) and value.startswith("fn")
+
+
+def strip_footnote_markup(root: Tag) -> None:
+    """Remove footnote modals and their ``<sup>`` triggers from ``root``.
+
+    Newer judgments nest each footnote's modal ``div#fn-…`` inside the
+    paragraph that cites it, so the paragraph text used to carry "Foot
+    Note 2 × Affidavit of …" plus the marker digit. The footnote's text
+    already lands in ``footnote_text``. Bare ``<sup>`` tags with no
+    resolvable link (``<sup>[note: 1]</sup>``) are kept, as before.
+    """
+    for modal in root.find_all("div", id=_is_footnote_id):
+        modal.decompose()
+    for sup in root.find_all("sup"):
+        for trigger in sup.find_all(["a", "button"]):
+            target = (trigger.get("data-target") or trigger.get("href") or "").strip()
+            if target.startswith("#fn"):
+                sup.decompose()
+                break
+
+
 # ---------------------------------------------------------------------------
 # Public types
 # ---------------------------------------------------------------------------
@@ -113,7 +168,7 @@ def absorb_table(table: Tag) -> str:
         cells = row.find_all(["td", "th"])
         if not cells:
             continue
-        line = " | ".join(_normalize_ws(cell.get_text(" ", strip=True)) for cell in cells)
+        line = " | ".join(element_text(cell) for cell in cells)
         if line.replace("|", "").strip():
             lines.append(line)
     if not lines:
@@ -152,7 +207,9 @@ def extract_footnotes(soup: BeautifulSoup) -> Dict[str, str]:
     Keys are the raw element ids (e.g. ``fn1`` or
     ``fn-041fe0fc-fb3c-…``); values are the stripped text contents.
     Excludes the main judgment container, which also happens to have an
-    id starting with ``"f"`` in some themes.
+    id starting with ``"f"`` in some themes. Bootstrap modals keep only
+    their ``.modal-body``, dropping the "Foot Note n" title and the ×
+    close button.
     """
     result: Dict[str, str] = {}
     for el in soup.find_all("div", id=True):
@@ -164,7 +221,8 @@ def extract_footnotes(soup: BeautifulSoup) -> Dict[str, str]:
         # but be explicit.
         if fid in {"divJudgement", "divCaseSummary", "divHeadMessage"}:
             continue
-        text = _normalize_ws(el.get_text(" ", strip=True))
+        body = el.find("div", class_="modal-body") or el
+        text = element_text(body)
         if text:
             result[fid] = text
     return result
@@ -220,10 +278,12 @@ def _extract_element_content(element: Tag) -> _ElementContent:
     if root is None:
         # Defensive fallback — shouldn't happen for normal Judg-* divs.
         return _ElementContent(
-            text=_normalize_ws(element.get_text(" ", strip=True)),
+            text=element_text(element),
             has_table=False,
             has_figure=False,
         )
+
+    strip_footnote_markup(root)
 
     tables = list(root.find_all("table"))
     imgs = list(root.find_all("img"))
@@ -237,7 +297,7 @@ def _extract_element_content(element: Tag) -> _ElementContent:
     for i in imgs:
         i.decompose()
 
-    text = _normalize_ws(root.get_text(" ", strip=True))
+    text = element_text(root)
 
     for rendering in table_renderings:
         if rendering:
@@ -530,7 +590,7 @@ def extract_court_summary(soup: BeautifulSoup) -> str:
     div = soup.find("div", id="divCaseSummary")
     if div is None:
         return ""
-    return _normalize_ws(div.get_text(" ", strip=True))
+    return element_text(div)
 
 
 def extract_judgment(html: str, judgment_id: str) -> ExtractedJudgment:
