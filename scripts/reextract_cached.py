@@ -25,6 +25,10 @@ import sqlite_utils
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+# resources/judgments.py uses sibling imports (`import extraction`) that
+# resolve only when resources/ itself is on sys.path — same as conftest.py
+# and the zeeker resource loader do.
+sys.path.insert(0, str(ROOT / "resources"))
 
 from resources import extraction, extraction_cache  # noqa: E402
 from resources.judgments import (  # noqa: E402
@@ -39,11 +43,24 @@ def main() -> int:
     parser.add_argument("ids", nargs="*", help="judgment ids (default: all cached)")
     parser.add_argument("--db", default=str(ROOT / "zeeker-judgements.db"))
     parser.add_argument("--dry-run", action="store_true", help="parse only, write nothing")
+    parser.add_argument(
+        "--from-file",
+        metavar="PATH",
+        help="read judgment ids from PATH, one per line (e.g. the file written by"
+        " scripts/repair_poisoned_rows.py --emit-legacy-ids)",
+    )
     args = parser.parse_args()
 
-    ids = args.ids or sorted(
-        p.name.split(".")[0] for p in extraction_cache.HTML_DIR.glob("*.html.gz")
-    )
+    ids = args.ids
+    if args.from_file:
+        if ids:
+            parser.error("pass either ids or --from-file, not both")
+        ids = [
+            line.strip()
+            for line in Path(args.from_file).read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+    ids = ids or sorted(p.name.split(".")[0] for p in extraction_cache.HTML_DIR.glob("*.html.gz"))
     db = sqlite_utils.Database(args.db)
     table = db["judgments"]
     known = {r["id"] for r in db.query("SELECT id FROM judgments")}

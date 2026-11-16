@@ -295,9 +295,15 @@ def parse_decision_date(card) -> str:
     return ""
 
 
-def parse_court_from_url(source_url: str) -> str:
+def parse_court_from_url(source_url: str, citation: str = "") -> str:
     match = COURT_FROM_URL_RE.search(source_url)
-    return match.group(1).upper() if match else ""
+    if match:
+        return match.group(1).upper()
+    # 2026-11: a few slugs don't match the URL pattern — e.g.
+    # /gd/s/2013_SGHC115_ (source-side citation typo "[2013] SGHC115").
+    # Fall back to the citation's court token so court faceting stays clean.
+    cm = CITATION_RE.search(citation or "")
+    return cm.group(2).upper() if cm else ""
 
 
 def build_pdf_url(citation: str) -> str:
@@ -362,7 +368,7 @@ def parse_listing_page(html: str) -> List[Dict[str, Any]]:
                 "case_name": case_name,
                 "case_numbers": case_numbers,
                 "decision_date": decision_date,
-                "court": parse_court_from_url(source_url),
+                "court": parse_court_from_url(source_url, citation),
                 "subject_tags": json.dumps(subject_tags, ensure_ascii=False),
                 "source_url": source_url,
                 "pdf_url": build_pdf_url(citation),
@@ -437,6 +443,19 @@ def _is_quarantined(state: dict, jid: str, now: datetime) -> bool:
     return age_seconds < EXTRACT_RETRY_AFTER
 
 
+class MaintenancePageError(Exception):
+    """eLitigation served its ":: Maintenance Notice ::" stub with HTTP 200.
+
+    During maintenance windows the site answers every detail-page request
+    with an ~818-byte notice page (title ``:: eLitigation - Maintenance
+    Notice ::``) and a 200 status. A 2026-11 survey found 16 such windows
+    between Jul and Oct 2026 that poisoned 525 rows as permanently
+    has_content=0 before this detection existed. Deliberately NOT an
+    ``httpx.RequestError``: retrying within seconds never helps, and the
+    per-doc failure counter + quarantine already handle later retries.
+    """
+
+
 @retry(
     stop=stop_after_attempt(MAX_RETRIES),
     wait=wait_exponential(multiplier=2, min=1, max=10),
@@ -452,7 +471,12 @@ def _fetch_detail(client: httpx.Client, url: str) -> str:
         # 404 on a source_url means the judgment was removed — raise so
         # the caller can record a structural failure and quarantine.
         response.raise_for_status()
-    return response.text
+    text = response.text
+    # Maintenance stubs are 818 bytes, so the marker sits well inside the
+    # document head on stub pages; real judgment pages never carry it there.
+    if "eLitigation - Maintenance Notice" in text[:2000]:
+        raise MaintenancePageError(f"maintenance stub served for {url}")
+    return text
 
 
 PHASE2_ADDED_COLUMNS = {
