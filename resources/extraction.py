@@ -413,6 +413,158 @@ def walk_judgment_body(container: Tag):
             stack.append(child)
 
 
+# ---------------------------------------------------------------------------
+# Legacy/bare-template fallback (added 2026-11)
+# ---------------------------------------------------------------------------
+# A 2026-11 data survey found 902 rows where extraction reported "ok" but
+# produced empty content: their pages render div#divJudgement WITHOUT any
+# Judg-* classes, so the walker above yields zero fragments. Two shapes:
+#   - pre-~2003 template: body text in plain <p>/<blockquote> elements inside
+#     div.contentsOfFile, behind an h2.title header and a table#info-table
+#     of case metadata;
+#   - modern bare template (e.g. [2026] SGYC 1): body text in
+#     div.txt-body wrappers, headings in <h5>.
+# The fallback below walks the same container with block-level leaves and
+# emits "Legacy-*" fragments so those pages stop extracting as empty.
+
+LEGACY_PARAGRAPH_TAGS = {"p", "blockquote", "li", "pre"}
+LEGACY_HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+LEGACY_TXT_BODY = "txt-body"
+
+# Class tokens marking the page header (case name/citation) and the metadata
+# table — both duplicate catalog columns, never judgment content.
+LEGACY_SKIP_CLASS_TOKENS = {
+    "title",
+    "caseTitle",
+    "NCitation",
+    "info-row",
+    "info-delim1",
+    "txt-label",
+}
+LEGACY_INFO_TABLE_ID = "info-table"
+
+# Boilerplate that appears inside divJudgement on contentless pages (e.g.
+# [2022] SGHC 109 serves only the conversion disclaimer + version line +
+# footer). Pages with nothing else remain has_content=0, correctly.
+LEGACY_BOILERPLATE_RE = re.compile(
+    r"^(This judgment text has undergone conversion|Version No\b|©\s*SUPREME COURT"
+    r"|SUBSCRIBE TO SUPREME COURT|REPORT VULNERABILITY)",
+    re.IGNORECASE,
+)
+
+
+def _is_legacy_info_table(tag: Tag) -> bool:
+    """The pre-2003 metadata table (case number, decision date, …)."""
+    if tag.name != "table":
+        return False
+    if tag.get("id") == LEGACY_INFO_TABLE_ID:
+        return True
+    return tag.find("tr", class_="info-row") is not None
+
+
+def extract_legacy_paragraphs(
+    div_judgement: Tag,
+    footnote_map: Dict[str, str],
+    judgment_id: str,
+) -> List[Dict[str, Any]]:
+    """Fallback walker for pages whose divJudgement has no Judg-* classes.
+
+    Emits one fragment per outermost block-level element (``<p>``,
+    ``<blockquote>``, ``<li>``, headings, or a ``div`` carrying the
+    ``txt-body`` class token), skipping the case header, the metadata
+    table and known boilerplate. Tables and images attach to the most
+    recent fragment, mirroring the main walker's attachment rule.
+    """
+    fragments: List[Dict[str, Any]] = []
+    current_heading: Optional[str] = None
+    pending_tables: List[str] = []
+
+    def attach_figure(src: str, alt: str) -> None:
+        if not fragments:
+            return
+        f = fragments[-1]
+        f["content_text"] = f["content_text"] + "\n\n" + alt
+        f["has_figure"] = True
+        srcs = json.loads(f["figure_src"]) if f["figure_src"] else []
+        alts = json.loads(f["figure_descriptions"]) if f["figure_descriptions"] else []
+        srcs.append(src)
+        alts.append(alt)
+        f["figure_src"] = json.dumps(srcs, ensure_ascii=False)
+        f["figure_descriptions"] = json.dumps(alts, ensure_ascii=False)
+
+    stack: List[Any] = list(reversed(list(div_judgement.children)))
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, Tag):
+            continue
+        classes = node.get("class") or []
+        if any(tok in cls for cls in classes for tok in LEGACY_SKIP_CLASS_TOKENS):
+            # Case header / metadata chrome — catalog columns already carry it.
+            continue
+        if node.name == "table":
+            if _is_legacy_info_table(node):
+                continue
+            rendering = absorb_table(node)
+            if not rendering:
+                continue
+            if fragments:
+                f = fragments[-1]
+                f["content_text"] = f["content_text"] + rendering
+                f["has_table"] = True
+            else:
+                pending_tables.append(rendering)
+            continue
+        if node.name == "img":
+            src, alt = absorb_figure(node)
+            attach_figure(src, alt)
+            continue
+        is_block = node.name in LEGACY_PARAGRAPH_TAGS or node.name in LEGACY_HEADING_TAGS
+        is_txt_body = node.name == "div" and LEGACY_TXT_BODY in " ".join(classes)
+        if not (is_block or is_txt_body):
+            # Plain wrapper — descend.
+            for child in reversed(list(node.children)):
+                stack.append(child)
+            continue
+        content = _extract_element_content(node)
+        text = content.text
+        if not text or LEGACY_BOILERPLATE_RE.match(text):
+            continue
+        if node.name in LEGACY_HEADING_TAGS:
+            current_heading = text
+            class_name = f"Legacy-{node.name}"
+        else:
+            class_name = "Legacy-txt-body" if is_txt_body else f"Legacy-{node.name}"
+        paragraph_number: Optional[int] = None
+        if node.name == "p":
+            num, rest = parse_paragraph_number(text)
+            if num is not None:
+                paragraph_number, text = num, rest
+        footnote_texts = [
+            footnote_map[fid] for fid in collect_footnote_refs(node) if fid in footnote_map
+        ]
+        fragment = _make_fragment(
+            judgment_id=judgment_id,
+            ordinal=len(fragments),
+            html_raw=str(node),
+            class_name=class_name,
+            paragraph_number=paragraph_number,
+            section_heading=current_heading,
+            text=text,
+            has_table=content.has_table,
+            has_figure=content.has_figure,
+            figure_srcs=content.figure_srcs,
+            figure_alts=content.figure_alts,
+            footnote_texts=footnote_texts,
+        )
+        if pending_tables:
+            fragment["content_text"] = "".join(pending_tables) + fragment["content_text"]
+            fragment["has_table"] = True
+            pending_tables.clear()
+        fragments.append(fragment)
+
+    return fragments
+
+
 def extract_paragraphs(
     div_judgement: Tag,
     footnote_map: Dict[str, str],
@@ -602,6 +754,10 @@ def extract_judgment(html: str, judgment_id: str) -> ExtractedJudgment:
 
     footnote_map = extract_footnotes(soup)
     fragments = extract_paragraphs(div_j, footnote_map, judgment_id)
+    if not fragments:
+        # Pages rendered without Judg-* classes (legacy/bare templates).
+        # See extract_legacy_paragraphs for the two known shapes.
+        fragments = extract_legacy_paragraphs(div_j, footnote_map, judgment_id)
     content_text = _compose_content_text(fragments)
     court_summary = extract_court_summary(soup)
 

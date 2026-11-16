@@ -523,3 +523,100 @@ class TestExtractionCacheCorruption:
         ec = self._with_temp_cache(monkeypatch, tmp_path)
         assert ec.read_extraction("never-existed") is None
         assert ec.read_html("never-existed") is None
+
+
+# ---------------------------------------------------------------------------
+# Legacy/bare-template fallback (2026-11)
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyTemplateFallback:
+    """Pages whose divJudgement carries no Judg-* classes must still extract.
+
+    Found in the 2026-11 data survey: 902 rows — mostly 2000-2002 era plus
+    a few modern bare-template pages — extracted as "ok" with empty content
+    because the Judg-* walker found nothing to walk.
+    """
+
+    SYNTHETIC_OLD_TEMPLATE = """
+    <html><body>
+    <div id="divJudgement">
+      <div class="contentsOfFile">
+        <h2 class="title"><span class="caseTitle">Foo v Bar</span><br>
+        <span class="NCitation">[2000] SGHC 1</span></h2>
+        <table id="info-table"><tbody>
+          <tr class="info-row"><td class="txt-label">Case Number</td>
+          <td class="info-delim1">:</td><td>Suit 1/2000</td></tr>
+          <tr class="info-row"><td class="txt-label">Decision Date</td>
+          <td class="info-delim1">:</td><td>1 January 2000</td></tr>
+        </tbody></table>
+        <p>1\xa0The plaintiff sues for defamation.</p>
+        <p>2\xa0Damages are agreed between the parties.</p>
+        <blockquote>The alleged words meant that the plaintiff was dishonest.</blockquote>
+        <table><tr><td>Item</td><td>Cost</td></tr><tr><td>Hammer</td><td>5</td></tr></table>
+      </div>
+    </div>
+    </body></html>
+    """
+
+    def test_old_template_yields_numbered_fragments(self):
+        out = extract_judgment(self.SYNTHETIC_OLD_TEMPLATE, "syn001")
+        assert out.has_content
+        assert len(out.fragments) == 3
+        first = out.fragments[0]
+        assert first["class_name"] == "Legacy-p"
+        assert first["paragraph_number"] == 1
+        assert "plaintiff sues" in first["content_text"]
+        assert out.fragments[1]["paragraph_number"] == 2
+
+    def test_old_template_skips_header_and_info_table(self):
+        out = extract_judgment(self.SYNTHETIC_OLD_TEMPLATE, "syn001")
+        for f in out.fragments:
+            assert not f["content_text"].startswith("Case Number")
+            assert not f["content_text"].startswith("Decision Date")
+        assert "Foo v Bar" not in out.content_text
+        assert "Suit 1/2000" not in out.content_text
+
+    def test_old_template_blockquote_and_table_attach(self):
+        out = extract_judgment(self.SYNTHETIC_OLD_TEMPLATE, "syn001")
+        quote = out.fragments[2]
+        assert quote["class_name"] == "Legacy-blockquote"
+        # Orphan table backward-attaches to the most recent fragment.
+        assert quote["has_table"]
+        assert "---table---" in quote["content_text"]
+        assert "Hammer" in quote["content_text"]
+
+    def test_fixture_pre_2003_template_extracts(self):
+        # Real cached page for [2000] SGHC 275 — extracted as empty before
+        # the fallback existed (has_content=0 in the live DB since 2026-10).
+        html = (FIXTURES / "legacy" / "legacy_2000_sghc_275.html").read_text()
+        out = extract_judgment(html, "357398d5043d")
+        assert out.has_content
+        # Case name lives in the skipped h2.title (catalog case_name
+        # column) — assert on real body prose instead.
+        assert "Grounds of Decision" in out.content_text
+        assert "Admiralty" in out.content_text
+        assert len(out.fragments) > 10
+        assert all(f["class_name"].startswith("Legacy-") for f in out.fragments)
+        for f in out.fragments:
+            assert not f["content_text"].startswith("Case Number")
+
+    def test_fixture_modern_bare_template_extracts(self):
+        # [2026] SGYC 1 — modern page that uses div.txt-body instead of
+        # Judg-* classes.
+        html = (FIXTURES / "legacy" / "legacy_2026_sgyc_1.html").read_text()
+        out = extract_judgment(html, "f0d6a5afbcb2")
+        assert out.has_content
+        classes = {f["class_name"] for f in out.fragments}
+        assert "Legacy-txt-body" in classes
+        assert "YOUTH COURT APPEAL" in out.content_text
+        assert len(out.fragments) > 20
+
+    def test_fixture_shell_page_stays_empty(self):
+        # [2022] SGHC 109 serves only the conversion disclaimer, a version
+        # line and the footer — no judgment text. Must remain has_content=0.
+        html = (FIXTURES / "legacy" / "shell_2022_sghc_109.html").read_text()
+        out = extract_judgment(html, "5599ff0dfe9d")
+        assert not out.has_content
+        assert out.fragments == []
+        assert out.content_text == ""
