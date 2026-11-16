@@ -304,7 +304,9 @@ Phase 1 trips the breaker, Phase 2 is skipped for that run.
    for `JUDGMENTS_EXTRACT_RETRY_AFTER` (24h) in
    `checkpoint_judgments_extraction.json`, so it can't burn the whole
    budget. Structurally empty pages are marked `has_content=0` once and
-   never retried.
+   never retried — since 2026-11 only *genuinely* empty pages: the
+   maintenance stub described below now raises
+   `MaintenancePageError` and takes the retryable path instead.
 3. **LLM endpoint down (Phase 3).** `llm failed: …` per doc; failures
    are tracked in `checkpoint_judgments_summary.json`. Escalation
    ladder: <3 failures → retried on the primary model each build; 3–5 →
@@ -316,6 +318,47 @@ Phase 1 trips the breaker, Phase 2 is skipped for that run.
    (tmp + `os.replace`); fragment inserts are `INSERT OR IGNORE` on
    deterministic PKs; the next run recovers cached-but-unwritten work
    from disk without re-fetching or re-calling the LLM.
+5. **eLitigation maintenance windows (fixed 2026-11).** During
+   maintenance the site serves an ~818-byte
+   `:: eLitigation - Maintenance Notice ::` page with **HTTP 200** for
+   every detail-page request. Before detection existed, 16 windows
+   between Jul and Oct 2026 cached those stubs as *permanent*
+   "div#divJudgement not found" empties — 525 rows stuck at
+   `has_content=0` whose live pages were perfectly fine (verified
+   2026-11-16). `_fetch_detail` now raises `MaintenancePageError`
+   (transient; not tenacity-retried, not cached) so the failure counter
+   + breaker handle it. Windows are sporadic (days apart, various
+   hours, some lasting a day+), so no cron rescheduling helps.
+6. **Legacy/bare page template (fixed 2026-11).** ~900 rows — mostly
+   2000–2002 era plus a few modern pages (e.g. `[2026] SGYC 1`) —
+   render `div#divJudgement` **without any `Judg-*` classes** (body in
+   plain `<p>`/`div.txt-body`). The Judg-* walker yielded zero
+   fragments, so extraction "succeeded" with empty content and marked
+   them `has_content=0` forever. `extract_judgment` now falls back to
+   `extract_legacy_paragraphs` (block-level leaves, `Legacy-*` fragment
+   classes) when the main walker finds nothing. Pages with no real text
+   at all (e.g. `[2022] SGHC 109`, just the conversion disclaimer)
+   correctly stay `has_content=0`.
+
+**Recovery recipe for damage predating the two fixes** (2026-11 survey
+found 1,427 poisoned rows + 16 duplicates + 1 empty `court`):
+
+```bash
+# Run BETWEEN cron build windows (the DB is locked while a build runs).
+# Dry-run first — everything is a plan printout until --apply.
+uv run python scripts/repair_poisoned_rows.py --emit-legacy-ids /tmp/legacy_ids.txt
+uv run python scripts/repair_poisoned_rows.py --emit-legacy-ids /tmp/legacy_ids.txt --apply
+# Re-parse the 900 legacy pages from cached HTML (no server traffic):
+uv run python scripts/reextract_cached.py --from-file /tmp/legacy_ids.txt
+# Let the 6-hourly builds refetch the stub rows + re-summarise, or drain
+# faster with manual runs (JUDGMENTS_EXTRACT_MAX_PER_RUN=200 …).
+```
+
+Verification afterwards: `has_content=0` should only contain genuinely
+empty pages (LawNet admin-note stubs, `[2022] SGHC 109`-style shells,
+withdrawn judgments) and
+`SELECT citation, COUNT(*) FROM judgments GROUP BY citation HAVING COUNT(*) > 1`
+should return nothing.
 
 **State files (all gitignored, all safe to inspect):**
 
